@@ -2798,10 +2798,18 @@ class App:
         f = self._a_tab_timing
         ttk.Label(f, text="Frame Period Timing (A Board)",
                   style="H.TLabel").pack(padx=16, pady=(12, 4), anchor="w")
+        # Dynamic device type label (updated on firmware load)
+        self._a_timing_device_lbl = ttk.Label(f, text="",
+                                               style="Dim.TLabel")
+        self._a_timing_device_lbl.pack(padx=16, anchor="w")
         ttk.Label(f,
             text="Patch MOVW Rd, #10000 sites to change the display "
                  "frame period.  Lower µs = higher fps = lower latency.",
             style="Dim.TLabel").pack(padx=16, anchor="w")
+        # 040-specific warning (hidden until 040 firmware loaded)
+        self._a_timing_040_warn = tk.Label(f, text="",
+            bg=C["bg"], fg="#fab387",
+            font=("Segoe UI", 9), justify="left", anchor="w")
         ttk.Separator(f).pack(fill="x", padx=16, pady=8)
 
         # Preset buttons
@@ -2822,10 +2830,11 @@ class App:
                    command=lambda: self._apply_fps_preset(
                        FRAME_PERIOD_144)
                    ).pack(side="left", padx=6)
-        ttk.Label(inner_pf,
+        self._a_timing_preset_warn = ttk.Label(inner_pf,
                   text="  ⚠ 120 fps is recommended.  "
                        "144 fps may cause artifacts on some units.",
-                  style="Warn.TLabel").pack(side="left", padx=12)
+                  style="Warn.TLabel")
+        self._a_timing_preset_warn.pack(side="left", padx=12)
 
         # Site table
         cols = ("idx", "poff", "reg", "stock", "current", "fps")
@@ -2851,27 +2860,67 @@ class App:
         # Info panel
         info = ttk.LabelFrame(f, text="  How It Works  ")
         info.pack(fill="x", padx=16, pady=8)
-        info_text = (
-            "  The A board firmware uses a timer interrupt to drive "
-            "the display frame period.\n"
-            "  Each MOVW site loads a period value in microseconds "
-            "into a register.\n\n"
-            "  • 100 fps = 10,000 µs  (V4.1.7 stock)\n"
-            "  • 120 fps =  8,333 µs  (recommended low-latency)\n"
-            "  • 144 fps =  6,944 µs  (V4.1.6 stock for first "
-            "two sites)\n\n"
-            "  Presets patch the FIRST TWO sites only, "
-            "matching known latency patches.\n"
-            "  The instruction is MOVW Rd, #imm16 "
-            "(Thumb-2 encoding, 4 bytes)."
-        )
-        tk.Label(info, text=info_text, bg=C["bg"], fg=C["dim"],
-                 font=self.font_mono_sm, justify="left", anchor="w"
-                 ).pack(padx=8, pady=8, fill="x")
+        self._a_timing_info_label = tk.Label(info, text="",
+                 bg=C["bg"], fg=C["dim"],
+                 font=self.font_mono_sm, justify="left", anchor="w")
+        self._a_timing_info_label.pack(padx=8, pady=8, fill="x")
 
     def _refresh_a_timing(self):
         tree = self.a_timing_tree
         tree.delete(*tree.get_children())
+        # Update device-type label and info panel
+        if self.fw_a.raw:
+            dt = self.fw_a.device_type
+            if dt == "040":
+                self._a_timing_device_lbl.config(
+                    text="Device: SKY04O Pro (040)  —  MK22FN256 + LT9211 "
+                         "+ MIPI OLED")
+                self._a_timing_040_warn.pack_forget()
+                self._a_timing_preset_warn.config(
+                    text="  ⚠ 120 fps is recommended.  "
+                         "144 fps may cause artifacts on some units.")
+                info_text = (
+                    "  The A board firmware uses a timer interrupt to "
+                    "drive the display frame period.\n"
+                    "  Each MOVW site loads a period value in "
+                    "microseconds into a register.\n\n"
+                    "  • 100 fps = 10,000 µs  (stock)\n"
+                    "  • 120 fps =  8,333 µs  (recommended "
+                    "low-latency)\n"
+                    "  • 144 fps =  6,944 µs  (aggressive — test "
+                    "carefully)\n\n"
+                    "  040 and X4Pro share identical LT9211 bridge "
+                    "config, PLL pixel clock,\n"
+                    "  and MIPI DSI timing.  The same fps presets "
+                    "apply to both devices.\n\n"
+                    "  Presets patch the FIRST TWO sites only.\n"
+                    "  The instruction is MOVW Rd, #imm16 "
+                    "(Thumb-2 encoding, 4 bytes)."
+                )
+            else:
+                self._a_timing_device_lbl.config(
+                    text="Device: SKY04X Pro  —  MK22FN256 + LT9211 "
+                         "+ MIPI OLED")
+                self._a_timing_040_warn.pack_forget()
+                self._a_timing_preset_warn.config(
+                    text="  ⚠ 120 fps is recommended.  "
+                         "144 fps may cause artifacts on some units.")
+                info_text = (
+                    "  The A board firmware uses a timer interrupt to "
+                    "drive the display frame period.\n"
+                    "  Each MOVW site loads a period value in "
+                    "microseconds into a register.\n\n"
+                    "  • 100 fps = 10,000 µs  (V4.1.7 stock)\n"
+                    "  • 120 fps =  8,333 µs  (recommended "
+                    "low-latency)\n"
+                    "  • 144 fps =  6,944 µs  (V4.1.6 stock for "
+                    "first two sites)\n\n"
+                    "  Presets patch the FIRST TWO sites only, "
+                    "matching known latency patches.\n"
+                    "  The instruction is MOVW Rd, #imm16 "
+                    "(Thumb-2 encoding, 4 bytes)."
+                )
+            self._a_timing_info_label.config(text=info_text)
         if not self.fw_a.raw:
             return
         for i, site in enumerate(self.fw_a.frame_timing_sites):
