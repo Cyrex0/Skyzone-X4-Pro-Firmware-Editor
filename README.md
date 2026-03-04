@@ -1,6 +1,6 @@
 # Skyzone SKY04X Pro Firmware Editor
 
-Visual firmware editor for the **Skyzone SKY04X Pro** FPV goggles. Modify timing delays, image quality, panel initialization, and register tables through an intuitive dark-themed GUI — no hex editor required.
+Visual firmware editor for the **Skyzone SKY04X Pro** FPV goggles. Modify timing delays, frame rate, image quality, panel initialization, and register tables through an intuitive dark-themed GUI — no hex editor required.
 
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)
 ![Platform](https://img.shields.io/badge/Platform-Windows-0078d4?logo=windows)
@@ -17,6 +17,7 @@ Visual firmware editor for the **Skyzone SKY04X Pro** FPV goggles. Modify timing
 - **💾 Hex Viewer** — Navigate the binary with quick-jump buttons, diff highlighting for modified bytes, and direct byte editing.
 
 ### A Board — MK22FN256 (ARM Cortex-M4 Display Controller)
+- **⏱️ Frame Timing** — Adjust OLED refresh rate with one-click presets for **100 fps** (stock), **120 fps**, and **144 fps**. Patches MOVW Thumb-2 frame-period immediates.
 - **🔧 Panel Init Tables** — Edit OLED panel driver initialization values (170 register entries, 100% coverage). Double-click to modify.
 - **📖 Register Reference** — Complete read-only database for all four ICs:
   - Panel OLED Driver (75 regs)
@@ -41,20 +42,18 @@ Visual firmware editor for the **Skyzone SKY04X Pro** FPV goggles. Modify timing
 1. Download the latest release `.zip`
 2. Extract to a folder
 3. Place your stock firmware files in the `firmware/` subfolder (or next to the `.exe`):
-   - `tw8836_mcu.bin` — B board MCU binary
-   - `SKY04XPro_A_APP_V4.1.4.bin` — A board firmware
+   - `SKY04X_Pro_B_APP_V4.0.2.bin` — B board MCU binary
+   - `SKY04XPro_A_APP_V4.1.6.bin` or `SKY04XPro_A_APP_V4.1.7.bin` — A board firmware
 4. Run `skyzone_editor.exe`
 
 ### Option B: Run from Python
 ```bash
-# Clone / download this repo
 pip install tk   # usually included with Python
 
-# Run from the project root
-python tools/skyzone_editor.py
+python skyzone_editor.py
 
 # Or specify firmware paths explicitly
-python tools/skyzone_editor.py --b tw8836_mcu.bin --a firmware/A_APP.bin
+python skyzone_editor.py --b firmware/SKY04X_Pro_B_APP_V4.0.2.bin --a firmware/SKY04XPro_A_APP_V4.1.7.bin
 ```
 
 ---
@@ -63,30 +62,56 @@ python tools/skyzone_editor.py --b tw8836_mcu.bin --a firmware/A_APP.bin
 
 | File | Board | MCU | Size | Description |
 |------|-------|-----|------|-------------|
-| `tw8836_mcu.bin` | B | TW8836 (8051) | 204,800 B | Video processor, OSD, analog decoder |
-| `SKY04XPro_A_APP_V4.1.4.bin` | A | MK22FN256 (ARM) | ~222 KB | Display controller, HDMI Rx, LVDS bridge |
+| `SKY04X_Pro_B_APP_V4.0.2.bin` | B | TW8836 (8051) | 14.8 MB | Video processor, OSD, analog decoder |
+| `SKY04XPro_A_APP_V4.1.6.bin` | A | MK22FN256 (ARM) | 227,840 B | Display controller, HDMI Rx, LVDS bridge |
+| `SKY04XPro_A_APP_V4.1.7.bin` | A | MK22FN256 (ARM) | 228,864 B | Display controller, HDMI Rx, LVDS bridge |
 
-**⚠️ Firmware files are NOT included in this repo.** Extract them from your goggles' SPI flash or obtain from Skyzone support. The editor will auto-detect files placed in the project directory.
+**⚠️ Firmware files are NOT included in this repo.** Extract them from your goggles' SPI flash or obtain from Skyzone support. The editor will auto-detect files placed in the `firmware/` directory.
+
+---
+
+## Frame Timing / FPS Presets
+
+The A board controls the OLED panel refresh rate via frame-period values stored as MOVW Thumb-2 immediates. The editor scans for these and provides one-click presets:
+
+| Preset | Frame Period (µs) | Refresh Rate |
+|--------|-------------------|--------------|
+| Stock  | 10,000            | 100 fps      |
+| 120fps | 8,333             | ≈120 fps     |
+| 144fps | 6,944             | ≈144 fps     |
+
+The timing tab patches the first two frame-period sites (which control the actual display timing). V4.1.6 ships with 144 fps at these sites by default; V4.1.7 reverted to 100 fps.
+
+---
+
+## A Board XOR Encoding
+
+The A board firmware payload is XOR-encoded with a **per-block key schedule**:
+
+```
+key = (0x55 + floor(payload_offset / 512)) & 0xFF
+```
+
+Each 512-byte block uses an incrementing key starting from `0x55`. The editor handles this transparently — all UI values show decoded data, and saves re-encode correctly.
 
 ---
 
 ## Building the .exe
 
 ```bash
-# From the project root
 pip install pyinstaller
-python build_release.py
+python build.py
 ```
 
 This creates a `release/` folder containing:
 ```
 release/
-├── skyzone_editor.exe      # Standalone executable
-├── firmware/               # Stock firmware files (if present)
-│   ├── tw8836_mcu.bin
-│   └── SKY04XPro_A_APP_V4.1.4.bin
-├── tools/
-│   └── skyzone_editor.py   # Python source
+├── skyzone_editor.exe            # Standalone executable
+├── skyzone_editor.py             # Python source
+├── firmware/                     # Stock firmware files (if present)
+│   ├── SKY04X_Pro_B_APP_V4.0.2.bin
+│   ├── SKY04XPro_A_APP_V4.1.6.bin
+│   └── SKY04XPro_A_APP_V4.1.7.bin
 └── README.md
 ```
 
@@ -112,15 +137,13 @@ release/
 ## Project Structure
 
 ```
-skyzone_re/
-├── tools/
-│   ├── skyzone_editor.py    # ← Unified editor (this project)
-│   ├── fw_editor.py         # B board standalone editor
-│   └── fw_editor_a.py       # A board standalone editor
-├── firmware/                # Stock firmware files
-├── patched/                 # Saved outputs (auto-created)
-│   └── backups/             # Stock backups (auto-created)
-├── build_release.py         # PyInstaller build script
+skyzone_editor/
+├── skyzone_editor.py    # Main editor application
+├── build.py             # PyInstaller build script
+├── firmware/            # Stock firmware files
+├── patched/             # Saved outputs (auto-created)
+│   └── backups/         # Stock backups (auto-created)
+├── .gitignore
 └── README.md
 ```
 
@@ -133,6 +156,12 @@ Pull requests welcome. Areas of interest:
 - Preset profiles for different panel types
 - Linux/macOS testing
 - Firmware comparison tools
+
+---
+
+## License
+
+MIT
 
 ---
 
