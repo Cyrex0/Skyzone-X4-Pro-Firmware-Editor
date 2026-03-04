@@ -731,12 +731,19 @@ FRAME_PERIOD_144   = 6944    # ~144 fps (1 000 000 / 144)
 # ── Panel OLED Driver Register Database (75 registers) ────────────────
 PANEL_REGS: Dict[int, Tuple[str, str]] = {
     0x00: ("NOP",                   "No operation / table padding byte"),
+    0x01: ("SOFT_RESET",            "Software reset command"),
     0x02: ("POWER_CTRL",           "Power control / driver output level"),
+    0x03: ("DISP_ID",              "Display identification readback"),
     0x04: ("READ_DDB",             "Read display identification"),
     0x05: ("DSI_ERR",              "DSI error status / flags"),
     0x06: ("DISP_FUNC_CTRL",       "Display function control, timing"),
+    0x07: ("DISP_CTRL",            "Display control configuration"),
+    0x08: ("PANEL_STATE",           "Panel state / configuration data"),
     0x09: ("DISP_STATUS",          "Display status / diagnostic readback"),
+    0x0A: ("GET_POWER_STATE",       "Read power state register"),
+    0x0C: ("GET_PIXEL_FMT",         "Read pixel format register"),
     0x0D: ("GET_POWER_MODE",       "Read power mode / display state"),
+    0x0E: ("GET_IMG_MODE",          "Read image display mode"),
     0x10: ("SLEEP_IN",             "Enter sleep mode (low power)"),
     0x11: ("SLEEP_OUT",            "Exit sleep mode (wait after write)"),
     0x12: ("PARTIAL_MODE_ON",      "Partial display mode enable"),
@@ -746,23 +753,43 @@ PANEL_REGS: Dict[int, Tuple[str, str]] = {
     0x17: ("GAMMA_REF_VOLT",       "Gamma reference voltage / gate output"),
     0x19: ("VCOM_CTRL_1",          "VCOM voltage control 1"),
     0x1A: ("VCOM_CTRL_2",          "VCOM voltage control 2"),
+    0x1B: ("VCOM_OFFSET",           "VCOM offset / fine trim"),
     0x1D: ("COL_ADDR_SET",         "Column address set"),
     0x1E: ("PIXEL_FORMAT",         "Pixel format (RGB / interface bits)"),
     0x1F: ("SELF_DIAG",            "Self-diagnostics result readback"),
     0x20: ("DISP_INVERSION",       "Display inversion control"),
+    0x21: ("DISP_INV_ON",           "Display inversion on"),
+    0x22: ("ALL_PIX_OFF",           "All pixels off command"),
     0x23: ("PANEL_CFG",            "Panel configuration register"),
     0x24: ("PANEL_DRIVE",          "Panel drive strength"),
+    0x26: ("GAMMA_SET",             "Gamma curve selection"),
     0x27: ("CONTRAST_CTRL",        "Contrast / brightness fine adjust"),
+    0x28: ("DISP_OFF",              "Display off"),
+    0x2A: ("COL_ADDR_START",        "Column address start"),
+    0x2C: ("MEM_WRITE",             "Memory write start"),
+    0x2E: ("MEM_READ",              "Memory read start"),
     0x2F: ("MEM_WRITE_CONT",       "Memory write continue (data stream)"),
+    0x30: ("PARTIAL_AREA_DEF",      "Partial area definition"),
     0x31: ("GATE_CTRL",            "Gate driver control"),
     0x32: ("SCROLL_AREA",          "Vertical scroll area definition"),
     0x33: ("SCROLL_START",         "Vertical scroll start address"),
     0x36: ("MEM_ACCESS_CTRL",      "Memory access / scan direction (MADCTL)"),
+    0x37: ("VSCROLL_ADDR",          "Vertical scroll start address"),
+    0x38: ("IDLE_OFF",              "Idle mode off"),
+    0x39: ("IDLE_ON",               "Idle mode on"),
     0x3C: ("DISP_TIMING",          "Display timing / blanking control"),
     0x40: ("GATE_SCAN_START",      "Gate scan start position / voltage"),
+    0x43: ("GATE_CTRL_EXT",         "Gate control extended"),
+    0x44: ("SET_TEAR_LINE",         "Set tear effect scanline"),
     0x45: ("GET_SCANLINE",         "Read current scan line position"),
     0x47: ("GET_BRIGHTNESS",       "Read current brightness level"),
     0x49: ("SRC_DRV_VOLTAGE",      "Source driver voltage adjust"),
+    0x4B: ("SRC_DRV_CTRL",          "Source driver control"),
+    0x4D: ("SRC_DRV_BIAS",          "Source driver bias level"),
+    0x4E: ("SRC_DRV_FINE",          "Source driver fine adjust"),
+    0x4F: ("PANEL_TIMING",          "Panel timing configuration"),
+    0x51: ("WRITE_BRIGHTNESS",      "Write display brightness value"),
+    0x52: ("READ_BRIGHTNESS",       "Read display brightness value"),
     0x55: ("INTERFACE_PIXEL",      "Interface pixel mode select"),
     0x56: ("ADAPTIVE_CTRL",        "Adaptive brightness / CABC control"),
     0x60: ("GAMMA_CH_0",           "Gamma channel 0 — voltage level"),
@@ -773,16 +800,23 @@ PANEL_REGS: Dict[int, Tuple[str, str]] = {
     0x66: ("GAMMA_CH_6",           "Gamma channel 6 — voltage level"),
     0x67: ("GAMMA_CH_7",           "Gamma channel 7 — voltage level"),
     0x68: ("GAMMA_CH_8",           "Gamma channel 8 — voltage level"),
+    0x6A: ("GAMMA_CH_A",            "Gamma channel A — voltage level"),
     0x6B: ("GAMMA_CH_B",           "Gamma channel B — voltage level"),
     0x6C: ("FRAME_RATE_A",         "Frame rate control A"),
     0x6D: ("FRAME_RATE_B",         "Frame rate control B"),
     0x6E: ("BRIGHTNESS",           "Panel brightness / greyscale level"),
+    0x6F: ("FRAME_RATE_C",          "Frame rate control C"),
+    0x70: ("GATE_DRV_CTRL",         "Gate driver control / scan mode"),
     0x72: ("GATE_OUT_EXT",         "Gate output extended / gamma trim"),
+    0x74: ("SRC_VOLTAGE_A",         "Source output voltage level A"),
     0x75: ("CONTRAST",             "Contrast control value"),
     0x76: ("SRC_OUT_LEVEL",        "Source output level trim"),
     0x78: ("SRC_TIMING",           "Source timing control"),
+    0x79: ("SRC_TIMING_D",          "Source timing control D"),
     0x7A: ("SRC_TIMING_B",         "Source timing control B"),
     0x7B: ("SRC_TIMING_C",         "Source timing control C"),
+    0x7D: ("SRC_CLK_A",             "Source clock adjustment A"),
+    0x7E: ("SRC_CLK_B",             "Source clock adjustment B"),
     0x80: ("GATE_OUT_0",           "Gate output level 0"),
     0x81: ("GATE_OUT_1",           "Gate output level 1"),
     0x82: ("GATE_OUT_2",           "Gate output level 2"),
@@ -792,15 +826,22 @@ PANEL_REGS: Dict[int, Tuple[str, str]] = {
     0x87: ("GATE_OUT_7",           "Gate output level 7"),
     0x88: ("GATE_TIMING_A",        "Gate timing control A"),
     0x8B: ("GATE_TIMING_D",        "Gate timing control D"),
+    0x8D: ("GATE_TIMING_E",         "Gate timing control E"),
     0x8E: ("GATE_TIMING_B",        "Gate timing control B"),
     0x8F: ("GATE_TIMING_C",        "Gate timing control C"),
     0x93: ("SRC_CLK_CTRL",         "Source clock control"),
+    0x96: ("POWER_GATE_A",          "Power / gate combined control A"),
     0x98: ("POWER_CFG_A",          "Power configuration A"),
     0x99: ("POWER_CFG_B",          "Power configuration B"),
     0x9A: ("POWER_CFG_C",          "Power configuration C"),
     0x9C: ("POWER_TIMING",         "Power timing / sequencing"),
+    0x9D: ("POWER_DRV_FINE",        "Power driver fine adjust"),
+    0x9E: ("POWER_AMP",             "Power amplifier control"),
+    0x9F: ("POWER_CFG_D",           "Power configuration D"),
     0xA2: ("POWER_DRV_A",          "Power driver strength A"),
     0xA3: ("POWER_DRV_B",          "Power driver strength B"),
+    0xA4: ("POWER_DRV_C",           "Power driver strength C"),
+    0xA5: ("POWER_DRV_D",           "Power driver strength D"),
     0xA6: ("POWER_LEVEL_A",        "Power voltage level A"),
     0xA7: ("POWER_LEVEL_B",        "Power voltage level B"),
     0xA8: ("POWER_LEVEL_C",        "Power voltage level C / ref"),
@@ -808,10 +849,14 @@ PANEL_REGS: Dict[int, Tuple[str, str]] = {
     0xAB: ("POWER_REF_A",          "Power reference level A"),
     0xAC: ("POWER_REF_B",          "Power reference level B"),
     0xAD: ("FREE_RUN_CTRL",        "Free-running / scan mode control"),
+    0xAE: ("DEEP_STANDBY",          "Deep standby mode control"),
     0xB0: ("POWER_SEQ_A",          "Power sequence control A"),
     0xB1: ("POWER_SEQ_B",          "Power sequence control B"),
     0xB3: ("INTF_TIMING",          "Interface timing control"),
+    0xB5: ("BLANKING_CTRL",         "Blanking porch control"),
+    0xBA: ("VCOM_DRV",              "VCOM driving strength"),
     0xBB: ("VCOM_LEVEL",           "VCOM DC level adjust"),
+    0xBC: ("VCOM_DRV_EXT",          "VCOM driving extended control"),
     0xBF: ("POWER_EXT",            "Power control extended"),
     0xC0: ("MFR_PWR_CTRL_1",       "Manufacturer power control 1"),
     0xC2: ("MFR_PWR_CTRL_2",       "Manufacturer power control 2"),
@@ -831,6 +876,9 @@ PANEL_REGS: Dict[int, Tuple[str, str]] = {
     0xD1: ("MFR_POWER_B",          "Manufacturer power setting B"),
     0xD3: ("MFR_POWER_C",          "Manufacturer power setting C"),
     0xD4: ("MFR_POWER_D",          "Manufacturer power setting D"),
+    0xD8: ("MFR_POWER_E",           "Manufacturer power setting E"),
+    0xD9: ("MFR_NVM_CTRL",          "Manufacturer NVM / status control"),
+    0xDA: ("MFR_DEVICE_ID",         "Manufacturer device ID readback"),
     0xDB: ("MFR_VCOM_A",           "Manufacturer VCOM adjust A"),
     0xDD: ("MFR_VCOM_B",           "Manufacturer VCOM adjust B"),
     0xDE: ("MFR_VCOM_C",           "Manufacturer VCOM adjust C"),
@@ -1205,6 +1253,7 @@ class FirmwareAnalyzerA:
         self.frame_timing_sites.clear()
         self._find_strings()
         self._find_frame_timing_sites()
+        self._find_panel_init_tables()
 
     def _detect_code_boundary(self):
         """Find where ARM code ends and string data begins."""
@@ -1285,6 +1334,198 @@ class FirmwareAnalyzerA:
             if imm16 in known_periods:
                 self.frame_timing_sites.append(
                     FrameTimingSite(i, rd, imm16, imm16))
+
+    # ── Panel Init Table Scanner ─────────────────────────────────────
+    def _find_panel_init_tables(self):
+        """Dynamically locate panel init data tables in the decoded payload.
+
+        The panel init function writes {reg, val} pairs to OLED panels
+        via I2C (device 0x4C = left eye, 0x4D = right eye).  The function
+        uses a loop that reads from a data table in flash via:
+
+            LDRH  R2, [Rn, #0]   ; read halfword from table
+            ADDS  R3, Rn, #2     ; pointer to next halfword
+            MOVS  R1, #0x4D      ; I2C device address
+            MOVS  R0, #0         ; bus 0
+            BL    sub_18330       ; I2C write
+            ADDS  Rn, #4         ; advance table pointer
+
+        We find this pattern, then trace backward to the function
+        prologue to extract table addresses from LDR Rx,[PC,#imm]
+        instructions in the literal pool.
+        """
+        self.panel_entries.clear()
+
+        # ── Step 1: find LDRH Rx,[Rn]; ADDS R3,Rn,#2; MOVS R1,#0x4D;
+        #            MOVS R0,#0  in the decoded payload
+        i2c_pat = bytes([0x4D, 0x21, 0x00, 0x20])
+        hits = []                             # (ldrh_poff, table_reg_Rn)
+        for i in range(4, len(self.decoded) - 8):
+            if self.decoded[i:i + 4] != i2c_pat:
+                continue
+            # preceding 4 bytes: LDRH R2,[Rn,#0] + ADDS R3,Rn,#2
+            b_ldrh_hi = self.decoded[i - 3]   # high byte of LDRH
+            b_adds_hi = self.decoded[i - 1]   # high byte of ADDS
+            if b_ldrh_hi == 0x88 and b_adds_hi == 0x1C:
+                rn = (self.decoded[i - 4] >> 3) & 0x07
+                rt = self.decoded[i - 4] & 0x07
+                if rt == 2:                   # LDRH R2, [Rn]
+                    hits.append((i - 4, rn))
+
+        if not hits:
+            return
+
+        # ── Step 2: for each hit find the enclosing function (PUSH) ──
+        best_func = None
+        best_ldr_count = 0
+
+        seen_funcs: set = set()
+        for ldrh_off, rn in hits:
+            # walk backward for PUSH {…, LR}  (B5xx)
+            push_off = None
+            for delta in range(2, 500, 2):
+                check = ldrh_off - delta
+                if check < 0:
+                    break
+                if self.decoded[check + 1] == 0xB5:
+                    push_off = check
+                    break
+            if push_off is None or push_off in seen_funcs:
+                continue
+            seen_funcs.add(push_off)
+
+            # Scan function body for LDR Rx,[PC,#imm] instructions
+            scan_end = min(ldrh_off + 160, len(self.decoded) - 2)
+            ldr_pcs = []
+            for j in range(push_off, scan_end, 2):
+                b1 = self.decoded[j + 1]
+                if (b1 & 0xF8) != 0x48:
+                    continue
+                rd = b1 & 0x07
+                imm8 = self.decoded[j]
+                pc_val = (j + A_FLASH_BASE + 4) & ~3
+                pool_addr = pc_val + imm8 * 4
+                pool_poff = pool_addr - A_FLASH_BASE
+                if 0 <= pool_poff + 3 < self.payload_size:
+                    pool_val = struct.unpack_from(
+                        '<I', self.decoded, pool_poff)[0]
+                    if A_FLASH_BASE <= pool_val < A_FLASH_BASE + self.payload_size:
+                        ldr_pcs.append((j, rd, pool_val))
+
+            flash_count = sum(1 for _, rd2, _ in ldr_pcs if rd2 == rn)
+            # Prefer callee-saved registers (R4-R7) because they
+            # survive across BL calls, meaning this is a LOOP over a
+            # data table rather than individual writes.
+            score = flash_count + (1000 if rn >= 4 else 0)
+            if score > best_ldr_count:
+                best_ldr_count = score
+                best_func = {
+                    'push_off': push_off,
+                    'table_reg': rn,
+                    'ldr_pcs': ldr_pcs,
+                    'scan_end': scan_end,
+                }
+
+        if best_func is None:
+            return
+
+        # ── Step 3: extract table addresses & counts ─────────────────
+        treg = best_func['table_reg']
+        push_off = best_func['push_off']
+        scan_end = best_func['scan_end']
+
+        # Unique table runtime addresses (loaded into the table register)
+        table_addrs = []
+        seen_addrs: set = set()
+        for _, rd, pv in best_func['ldr_pcs']:
+            if rd == treg and pv not in seen_addrs:
+                seen_addrs.add(pv)
+                table_addrs.append(pv)
+
+        if not table_addrs:
+            # fallback: any flash LDR
+            for _, rd, pv in best_func['ldr_pcs']:
+                if pv not in seen_addrs:
+                    seen_addrs.add(pv)
+                    table_addrs.append(pv)
+
+        # MOVS Rx, #imm  where Rx is NOT R0/R1 (bus/addr) and imm 15..100
+        count_for_addr: dict = {}
+        movs_list = []
+        for j in range(push_off, scan_end, 2):
+            b0 = self.decoded[j]
+            b1 = self.decoded[j + 1]
+            if (b1 & 0xF8) == 0x20:
+                rd = b1 & 0x07
+                imm = b0
+                if rd not in (0, 1) and 15 <= imm <= 100:
+                    movs_list.append((j, rd, imm))
+
+        # Pair each table address with closest count MOVS
+        for addr in table_addrs:
+            ldr_off = next(
+                j for j, rd, pv in best_func['ldr_pcs'] if pv == addr)
+            best_dist = 999
+            best_count = 65           # default
+            for mj, _, mcount in movs_list:
+                d = abs(mj - ldr_off)
+                if d < best_dist:
+                    best_dist = d
+                    best_count = mcount
+            count_for_addr[addr] = best_count
+
+        # Deduplicate overlapping tables  (V4.1.6 style)
+        table_addrs.sort()
+        merged: list = []
+        for addr in table_addrs:
+            if merged:
+                prev_addr, prev_count = merged[-1]
+                prev_end = prev_addr + prev_count * 4
+                if addr < prev_end:
+                    # overlapping → extend previous
+                    new_end = max(prev_end, addr + count_for_addr[addr] * 4)
+                    merged[-1] = (prev_addr, (new_end - prev_addr) // 4)
+                    continue
+            merged.append((addr, count_for_addr[addr]))
+
+        # Check for a hidden B table in the gap between two tables
+        if len(merged) >= 2:
+            extras = []
+            for ti in range(len(merged) - 1):
+                a1, c1 = merged[ti]
+                a2, _c2 = merged[ti + 1]
+                gap = a2 - (a1 + c1 * 4)
+                if gap > 0 and gap % 4 == 0:
+                    gap_count = gap // 4
+                    if 5 <= gap_count <= 50:
+                        extras.append((a1 + c1 * 4, gap_count))
+            merged.extend(extras)
+            merged.sort(key=lambda t: t[0])
+
+        # ── Step 4: populate panel entries ───────────────────────────
+        table_labels = "ABCDEFGH"
+        for ti, (addr, count) in enumerate(merged):
+            poff = addr - A_FLASH_BASE
+            tid = table_labels[ti] if ti < len(table_labels) else str(ti)
+            for grp in range(count):
+                grp_off = poff + grp * 4
+                if grp_off + 3 >= self.payload_size:
+                    break
+                for pair in range(2):
+                    byte_off = grp_off + pair * 2
+                    reg = self.decoded[byte_off]
+                    val = self.decoded[byte_off + 1]
+                    foff = self.payload_to_file(byte_off)
+                    self.panel_entries.append(PanelInitEntry(
+                        file_offset=foff,
+                        payload_offset=byte_off,
+                        reg=reg,
+                        value=val,
+                        original=val,
+                        table_id=tid,
+                        group_idx=grp,
+                        pair_pos=pair,
+                    ))
 
     def set_frame_period(self, site: FrameTimingSite, new_us: int):
         """Patch a MOVW site to a new frame period (µs)."""
