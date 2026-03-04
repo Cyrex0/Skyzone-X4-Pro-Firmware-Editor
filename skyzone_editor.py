@@ -2750,6 +2750,19 @@ class App:
             f"  Flash Base:     0x{A_FLASH_BASE:08X}  (48 KB bootloader)",
             "",
             f"  {'─' * 62}",
+            f"  Display",
+            f"  {'─' * 62}",
+            *([
+            f"  OLED Panel:     1280×720  (720p)",
+            f"  FOV:            42°",
+            f"  HDMI Input:     60 FPS",
+            ] if fw.device_type == "040" else [
+            f"  OLED Panel:     1920×1080  (1080p)",
+            f"  FOV:            52°",
+            f"  HDMI Input:     720P 100 FPS",
+            ]),
+            "",
+            f"  {'─' * 62}",
             f"  Chip",
             f"  {'─' * 62}",
             f"  MCU:            NXP Kinetis MK22FN256VLH12",
@@ -2874,7 +2887,7 @@ class App:
             if dt == "040":
                 self._a_timing_device_lbl.config(
                     text="Device: SKY04O Pro (040)  —  MK22FN256 + LT9211 "
-                         "+ MIPI OLED")
+                         "+ 1280×720 MIPI OLED  (42° FOV)")
                 self._a_timing_040_warn.pack_forget()
                 self._a_timing_preset_warn.config(
                     text="  ⚠ 120 fps is recommended.  "
@@ -2889,10 +2902,11 @@ class App:
                     "low-latency)\n"
                     "  • 144 fps =  6,944 µs  (aggressive — test "
                     "carefully)\n\n"
+                    "  040 OLED: 1280×720 (720p, 42° FOV)\n"
                     "  040 and X4Pro share identical LT9211 bridge "
-                    "config, PLL pixel clock,\n"
-                    "  and MIPI DSI timing.  The same fps presets "
-                    "apply to both devices.\n\n"
+                    "config and PLL pixel clock.\n"
+                    "  The 720p panel has fewer pixels per frame, "
+                    "so high fps presets should work well.\n\n"
                     "  Presets patch the FIRST TWO sites only.\n"
                     "  The instruction is MOVW Rd, #imm16 "
                     "(Thumb-2 encoding, 4 bytes)."
@@ -2900,7 +2914,7 @@ class App:
             else:
                 self._a_timing_device_lbl.config(
                     text="Device: SKY04X Pro  —  MK22FN256 + LT9211 "
-                         "+ MIPI OLED")
+                         "+ 1920×1080 MIPI OLED  (52° FOV)")
                 self._a_timing_040_warn.pack_forget()
                 self._a_timing_preset_warn.config(
                     text="  ⚠ 120 fps is recommended.  "
@@ -2915,6 +2929,7 @@ class App:
                     "low-latency)\n"
                     "  • 144 fps =  6,944 µs  (V4.1.6 stock for "
                     "first two sites)\n\n"
+                    "  X4Pro OLED: 1920×1080 (1080p, 52° FOV)\n\n"
                     "  Presets patch the FIRST TWO sites only, "
                     "matching known latency patches.\n"
                     "  The instruction is MOVW Rd, #imm16 "
