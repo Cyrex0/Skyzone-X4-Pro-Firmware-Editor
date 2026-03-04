@@ -2345,100 +2345,286 @@ class App:
         self._b_delay_scroll.bind_scroll()
 
     # ── B: Image Quality ──────────────────────────────────────────────
+
+    # Low-latency preset: disable/minimize all post-processing that
+    # adds per-line or per-frame latency in the TW8836 pipeline.
+    # Each tuple: (register, low_lat_value, description)
+    _B_LOW_LATENCY_REGS = [
+        # Decoder sharpness / peaking / filter
+        (0x112, 0x00, "DEC_SHARPNESS → off"),
+        (0x117, 0x00, "DEC_V_PEAKING → off"),
+        (0x12C, 0x00, "DEC_HFILTER → bypass"),
+        # CTI (color transient improvement) — all coefficients to zero
+        (0x120, 0x00, "CTI_COEFF_0 → zero"),
+        (0x121, 0x00, "CTI_COEFF_1 → zero"),
+        (0x122, 0x00, "CTI_COEFF_2 → zero"),
+        (0x123, 0x00, "CTI_COEFF_3 → zero"),
+        (0x124, 0x00, "CTI_COEFF_4 → zero"),
+        (0x125, 0x00, "CTI_COEFF_5 → zero"),
+        (0x126, 0x00, "CTI_COEFF_6 → zero"),
+        (0x127, 0x00, "CTI_COEFF_7 → zero"),
+        (0x128, 0x00, "CTI_COEFF_8 → zero"),
+        # Scaler line buffer
+        (0x20B, 0x02, "SC_LINEBUF_DLY → 2 (was 16, saves ~0.9ms)"),
+        # Image adjust
+        (0x284, 0x80, "IA_CONTRAST_Y → neutral"),
+        (0x28A, 0x80, "IA_BRIGHT_Y → neutral"),
+        (0x28B, 0x00, "IA_SHARPNESS → off"),
+        # Dither
+        (0x2E4, 0x00, "DITHER_CTRL → off"),
+    ]
+
+    # Grouped register layout for the Image Quality tab.
+    # Each tuple: (group_title, group_hint, [reg, ...])
+    _B_IMGQ_GROUPS: List[Tuple[str, str, List[int]]] = [
+        ("Decoder Processing",
+         "Analog video decoder — sharpness/peaking/filter each add "
+         "pipeline delay.  REG10C comb filter: keep 2D (0xCC); "
+         "3D (0xDC) adds ~16ms!",
+         [0x10C, 0x110, 0x111, 0x112, 0x113, 0x114, 0x115,
+          0x117, 0x12C]),
+        ("CTI — Color Transient Improvement",
+         "Chroma edge sharpening coefficients.  Set all to 0x00 to "
+         "disable CTI entirely (saves ~1 line of latency).",
+         [0x120, 0x121, 0x122, 0x123, 0x124, 0x125, 0x126,
+          0x127, 0x128, 0x12A, 0x12B]),
+        ("Scaler",
+         "REG20B line-buffer delay is the single biggest processing "
+         "latency item (~1ms at 16 lines).  Geometry regs (HDE/VDE) "
+         "control output position.",
+         [0x20B, 0x210, 0x215, 0x21C]),
+        ("Image Adjust — Contrast / Brightness",
+         "Output-stage colour tuning.  0x80 = neutral / bypass.  "
+         "Non-neutral values activate the adjustment LUT.",
+         [0x280, 0x281, 0x282, 0x283, 0x284, 0x285, 0x286,
+          0x287, 0x288, 0x289, 0x28A, 0x28B]),
+        ("Gamma / Dither",
+         "Gamma correction (CTRL0=0x00 already off) and spatial "
+         "dithering.  Dither adds a small processing step.",
+         [0x2E0, 0x2E4]),
+    ]
+
     def _build_b_imgq(self):
         f = self._b_tab_imgq
-        ttk.Label(f, text="Image Quality — Decoder Init Registers",
+        ttk.Label(f, text="Image Quality — Full Processing Pipeline",
                   style="H.TLabel").pack(padx=16, pady=(12, 4), anchor="w")
-        ttk.Label(f, text="Adjust picture quality set during init. "
+        ttk.Label(f, text="Every TW8836 post-processing register in the "
+                  "init table.  Tweak individually or use presets.  "
                   "Changes take effect on next boot.",
                   style="Dim.TLabel").pack(padx=16, anchor="w")
+
+        # ── Preset buttons ──
+        pf = ttk.LabelFrame(f, text="  Presets  ")
+        pf.pack(fill="x", padx=16, pady=(8, 0))
+        pi = ttk.Frame(pf)
+        pi.pack(padx=8, pady=8)
+        ttk.Button(pi, text="⚡ Low Latency",
+                   command=self._apply_b_low_latency).pack(
+                       side="left", padx=4)
+        ttk.Button(pi, text="↩ Stock Values",
+                   command=self._apply_b_stock_quality).pack(
+                       side="left", padx=4)
+        ttk.Button(pi, text="↩ Reset ALL Regs",
+                   command=self._reset_all_b_imgq).pack(
+                       side="left", padx=4)
+        self._b_imgq_preset_info = tk.Label(pf, text="",
+            bg=C["bg"], fg=C["dim"], font=self.font_mono_sm,
+            justify="left", anchor="w")
+        self._b_imgq_preset_info.pack(padx=8, pady=(0, 8), fill="x")
+
         ttk.Separator(f).pack(fill="x", padx=16, pady=10)
         self._b_imgq_scroll = ScrollFrame(f)
         self._b_imgq_scroll.pack(fill="both", expand=True, padx=16,
                                   pady=(0, 8))
         self._b_imgq_widgets: List[tk.Widget] = []
-        self._b_imgq_regs = [0x110, 0x111, 0x112, 0x113, 0x114, 0x10C,
-                              0x117, 0x20B, 0x210, 0x215, 0x21C,
-                              0x281, 0x282, 0x283]
+        # flat list derived from groups (for compat)
+        self._b_imgq_regs = [r for _, _, regs in self._B_IMGQ_GROUPS
+                              for r in regs]
 
     def _refresh_b_imgq(self):
-        for w in self._b_imgq_widgets:
-            w.destroy()
-        self._b_imgq_widgets.clear()
-        parent = self._b_imgq_scroll.inner
+        self._refresh_b_imgq_grouped(self.fw_b, self._b_imgq_scroll,
+                                     self._b_imgq_widgets,
+                                     self._refresh_b_imgq)
 
-        if not self.fw_b.init_regs:
+    def _refresh_b_imgq_grouped(self, fw, scroll, widgets, refresh_fn):
+        """Shared grouped Image Quality refresh for both B boards."""
+        for w in widgets:
+            w.destroy()
+        widgets.clear()
+        parent = scroll.inner
+
+        if not fw.init_regs:
             lbl = ttk.Label(parent, text="No init register table found.\n"
                             "Load a TW8836 MCU binary first.",
                             style="Dim.TLabel")
             lbl.pack(pady=30)
-            self._b_imgq_widgets.append(lbl)
-            self._b_imgq_scroll.bind_scroll()
+            widgets.append(lbl)
+            scroll.bind_scroll()
             return
 
-        for target_reg in self._b_imgq_regs:
-            entry = next((e for e in self.fw_b.init_regs
-                          if e.reg == target_reg), None)
-            if not entry:
+        # Count low-latency registers that are non-stock
+        ll_regs = {r for r, _, _ in self._B_LOW_LATENCY_REGS}
+        mod_count = sum(1 for e in fw.init_regs
+                        if e.reg in ll_regs and e.value != e.original)
+        total_regs_shown = 0
+
+        for grp_title, grp_hint, grp_regs in self._B_IMGQ_GROUPS:
+            # Check if any regs in this group exist in firmware
+            found = [r for r in grp_regs
+                     if any(e.reg == r for e in fw.init_regs)]
+            if not found:
                 continue
-            info = REGISTER_INFO.get(target_reg, ("Unknown", ""))
-            name, desc = info
-            card = tk.Frame(parent, bg=C["bg2"], bd=0,
-                            highlightthickness=1,
-                            highlightbackground=C["border"])
-            card.pack(fill="x", pady=4)
-            self._b_imgq_widgets.append(card)
-            # Title row
-            tf = tk.Frame(card, bg=C["bg2"])
-            tf.pack(fill="x", padx=12, pady=(8, 2))
-            is_mod = entry.value != entry.original
-            fg = C["mod"] if is_mod else C["accent"]
-            tk.Label(tf, text=f"REG{target_reg:03X}", bg=C["bg2"],
-                     fg=C["dim"], font=self.font_mono_sm).pack(side="left")
-            tk.Label(tf, text=f"  {name}", bg=C["bg2"], fg=fg,
+
+            # ── Group header ──
+            hdr = tk.Frame(parent, bg=C["bg"])
+            hdr.pack(fill="x", pady=(12 if total_regs_shown else 4, 2))
+            widgets.append(hdr)
+            tk.Label(hdr, text=f"━━  {grp_title}  ",
+                     bg=C["bg"], fg=C["accent"],
                      font=self.font_ui_bold).pack(side="left")
-            tk.Label(tf, text=f"  {desc}", bg=C["bg2"], fg=C["dim"],
-                     font=self.font_ui).pack(side="left")
-            if is_mod:
-                tk.Label(tf, text=f"  [Stock: 0x{entry.original:02X}]",
-                         bg=C["bg2"], fg=C["warn"],
-                         font=self.font_mono_sm).pack(side="right")
-            # Slider row
-            sf = tk.Frame(card, bg=C["bg2"])
-            sf.pack(fill="x", padx=12, pady=(2, 8))
-            var = tk.IntVar(value=entry.value)
-            val_label = tk.Label(sf,
-                text=f"0x{entry.value:02X} ({entry.value})",
-                bg=C["bg2"], fg=C["fg"], font=self.font_mono,
-                width=12, anchor="w")
+            sep_line = tk.Frame(hdr, bg=C["border"], height=1)
+            sep_line.pack(side="left", fill="x", expand=True,
+                          padx=(4, 0), pady=8)
+            hint_lbl = tk.Label(parent, text=grp_hint,
+                                bg=C["bg"], fg=C["dim"],
+                                font=self.font_ui, wraplength=750,
+                                justify="left", anchor="w")
+            hint_lbl.pack(fill="x", pady=(0, 6))
+            widgets.append(hint_lbl)
 
-            def _on_slide(val, vl=val_label, v=var):
-                iv = int(float(val))
-                v.set(iv)
-                vl.config(text=f"0x{iv:02X} ({iv})")
+            for target_reg in grp_regs:
+                entry = next((e for e in fw.init_regs
+                              if e.reg == target_reg), None)
+                if not entry:
+                    continue
+                total_regs_shown += 1
+                info = REGISTER_INFO.get(target_reg, ("Unknown", ""))
+                name, desc = info
+                is_ll = target_reg in ll_regs
+                card = tk.Frame(parent, bg=C["bg2"], bd=0,
+                                highlightthickness=1,
+                                highlightbackground=C["border"])
+                card.pack(fill="x", pady=3)
+                widgets.append(card)
+                # Title row
+                tf = tk.Frame(card, bg=C["bg2"])
+                tf.pack(fill="x", padx=12, pady=(6, 1))
+                is_mod = entry.value != entry.original
+                fg = C["mod"] if is_mod else C["accent"]
+                tk.Label(tf, text=f"REG{target_reg:03X}", bg=C["bg2"],
+                         fg=C["dim"], font=self.font_mono_sm
+                         ).pack(side="left")
+                tag = "  ⚡" if is_ll else "  "
+                tk.Label(tf, text=f"{tag}{name}", bg=C["bg2"], fg=fg,
+                         font=self.font_ui_bold).pack(side="left")
+                tk.Label(tf, text=f"  {desc}", bg=C["bg2"], fg=C["dim"],
+                         font=self.font_ui).pack(side="left")
+                if is_mod:
+                    tk.Label(tf, text=f"  [Stock: 0x{entry.original:02X}]",
+                             bg=C["bg2"], fg=C["warn"],
+                             font=self.font_mono_sm).pack(side="right")
+                # Slider row
+                sf = tk.Frame(card, bg=C["bg2"])
+                sf.pack(fill="x", padx=12, pady=(1, 6))
+                var = tk.IntVar(value=entry.value)
+                val_label = tk.Label(sf,
+                    text=f"0x{entry.value:02X} ({entry.value})",
+                    bg=C["bg2"], fg=C["fg"], font=self.font_mono,
+                    width=12, anchor="w")
 
-            ttk.Scale(sf, from_=0, to=255, orient="horizontal",
-                      variable=var, length=400,
-                      command=_on_slide).pack(side="left", padx=(0, 10))
-            val_label.pack(side="left", padx=(0, 10))
+                def _on_slide(val, vl=val_label, v=var):
+                    iv = int(float(val))
+                    v.set(iv)
+                    vl.config(text=f"0x{iv:02X} ({iv})")
 
-            def _apply(e=entry, v=var):
-                self.fw_b.set_init_reg(e, v.get())
-                self._refresh_b_imgq()
-                self._update_status()
+                ttk.Scale(sf, from_=0, to=255, orient="horizontal",
+                          variable=var, length=400,
+                          command=_on_slide).pack(side="left", padx=(0, 8))
+                val_label.pack(side="left", padx=(0, 8))
 
-            ttk.Button(sf, text="Apply", command=_apply, width=6
-                       ).pack(side="left", padx=4)
+                def _apply(e=entry, v=var):
+                    fw.set_init_reg(e, v.get())
+                    refresh_fn()
+                    self._update_status()
 
-            def _reset_one(e=entry):
-                self.fw_b.set_init_reg(e, e.original)
-                self._refresh_b_imgq()
-                self._update_status()
+                ttk.Button(sf, text="Apply", command=_apply, width=6
+                           ).pack(side="left", padx=3)
 
-            ttk.Button(sf, text="Reset", command=_reset_one, width=6
-                       ).pack(side="left")
+                def _reset_one(e=entry):
+                    fw.set_init_reg(e, e.original)
+                    refresh_fn()
+                    self._update_status()
 
-        self._b_imgq_scroll.bind_scroll()
+                ttk.Button(sf, text="Reset", command=_reset_one, width=6
+                           ).pack(side="left")
+
+        scroll.bind_scroll()
+
+    def _apply_b_low_latency(self):
+        """Apply low-latency preset: disable all post-processing."""
+        if not self.fw_b.init_regs:
+            messagebox.showwarning("Warning", "No B firmware loaded.")
+            return
+        if not messagebox.askyesno("Low Latency Preset",
+                "Disable ALL video post-processing to minimize latency?\n\n"
+                "This will:\n"
+                "  • Turn off decoder sharpness, V peaking & H filter\n"
+                "  • Zero all CTI (color transient) coefficients\n"
+                "  • Turn off scaler sharpness\n"
+                "  • Reduce line buffer delay 16→2 lines (saves ~0.9ms)\n"
+                "  • Set Y contrast/brightness to neutral\n"
+                "  • Disable dither\n\n"
+                "Image will look softer but pipeline delay drops ~1-2ms.\n"
+                "You can fine-tune individual registers after applying."):
+            return
+        changed = 0
+        for reg, val, desc in self._B_LOW_LATENCY_REGS:
+            entry = next((e for e in self.fw_b.init_regs
+                          if e.reg == reg), None)
+            if entry and entry.value != val:
+                self.fw_b.set_init_reg(entry, val)
+                changed += 1
+        self._refresh_b_imgq()
+        self._update_status()
+        self._b_imgq_preset_info.config(
+            text=f"  ⚡ Low latency applied: {changed} register(s) changed."
+                 f"  Post-processing disabled for minimum pipeline delay.",
+            fg=C["mod"])
+
+    def _apply_b_stock_quality(self):
+        """Reset low-latency registers to stock values."""
+        if not self.fw_b.init_regs:
+            messagebox.showwarning("Warning", "No B firmware loaded.")
+            return
+        changed = 0
+        for reg, _, _ in self._B_LOW_LATENCY_REGS:
+            entry = next((e for e in self.fw_b.init_regs
+                          if e.reg == reg), None)
+            if entry and entry.value != entry.original:
+                self.fw_b.set_init_reg(entry, entry.original)
+                changed += 1
+        self._refresh_b_imgq()
+        self._update_status()
+        self._b_imgq_preset_info.config(
+            text=f"  ↩ Stock quality restored: {changed} register(s) reset.",
+            fg=C["dim"])
+
+    def _reset_all_b_imgq(self):
+        """Reset ALL imgq registers (not just low-latency ones) to stock."""
+        if not self.fw_b.init_regs:
+            messagebox.showwarning("Warning", "No B firmware loaded.")
+            return
+        all_regs = {r for _, _, regs in self._B_IMGQ_GROUPS for r in regs}
+        changed = 0
+        for entry in self.fw_b.init_regs:
+            if entry.reg in all_regs and entry.value != entry.original:
+                self.fw_b.set_init_reg(entry, entry.original)
+                changed += 1
+        self._refresh_b_imgq()
+        self._update_status()
+        self._b_imgq_preset_info.config(
+            text=f"  ↩ All registers reset to stock: {changed} changed.",
+            fg=C["dim"])
 
     # ── B: Registers ──────────────────────────────────────────────────
     def _build_b_regs(self):
@@ -3406,96 +3592,110 @@ class App:
     # ── 040 B: Image Quality ──────────────────────────────────────────
     def _build_b040_imgq(self):
         f = self._b040_tab_imgq
-        ttk.Label(f, text="Image Quality — Decoder Init Registers (040 B)",
+        ttk.Label(f, text="Image Quality — Full Processing Pipeline (040 B)",
                   style="H.TLabel").pack(padx=16, pady=(12, 4), anchor="w")
-        ttk.Label(f, text="Adjust picture quality set during init. "
+        ttk.Label(f, text="Every TW8836 post-processing register in the "
+                  "040 init table.  Tweak individually or use presets.  "
                   "Changes take effect on next boot.",
                   style="Dim.TLabel").pack(padx=16, anchor="w")
+
+        # ── Preset buttons ──
+        pf = ttk.LabelFrame(f, text="  Presets  ")
+        pf.pack(fill="x", padx=16, pady=(8, 0))
+        pi = ttk.Frame(pf)
+        pi.pack(padx=8, pady=8)
+        ttk.Button(pi, text="⚡ Low Latency",
+                   command=self._apply_b040_low_latency).pack(
+                       side="left", padx=4)
+        ttk.Button(pi, text="↩ Stock Values",
+                   command=self._apply_b040_stock_quality).pack(
+                       side="left", padx=4)
+        ttk.Button(pi, text="↩ Reset ALL Regs",
+                   command=self._reset_all_b040_imgq).pack(
+                       side="left", padx=4)
+        self._b040_imgq_preset_info = tk.Label(pf, text="",
+            bg=C["bg"], fg=C["dim"], font=self.font_mono_sm,
+            justify="left", anchor="w")
+        self._b040_imgq_preset_info.pack(padx=8, pady=(0, 8), fill="x")
+
         ttk.Separator(f).pack(fill="x", padx=16, pady=10)
         self._b040_imgq_scroll = ScrollFrame(f)
         self._b040_imgq_scroll.pack(fill="both", expand=True,
                                     padx=16, pady=(0, 8))
         self._b040_imgq_widgets: List[tk.Widget] = []
-        self._b040_imgq_regs = [0x110, 0x111, 0x112, 0x113, 0x114, 0x10C,
-                                 0x117, 0x20B, 0x210, 0x215, 0x21C,
-                                 0x281, 0x282, 0x283]
+        self._b040_imgq_regs = [r for _, _, regs in self._B_IMGQ_GROUPS
+                                 for r in regs]
 
     def _refresh_b040_imgq(self):
-        for w in self._b040_imgq_widgets:
-            w.destroy()
-        self._b040_imgq_widgets.clear()
-        parent = self._b040_imgq_scroll.inner
+        self._refresh_b_imgq_grouped(self.fw_040b, self._b040_imgq_scroll,
+                                     self._b040_imgq_widgets,
+                                     self._refresh_b040_imgq)
 
+    def _apply_b040_low_latency(self):
+        """Apply low-latency preset to 040 B board."""
         if not self.fw_040b.init_regs:
-            lbl = ttk.Label(parent, text="No init register table found.\n"
-                            "Load a 040 B firmware first.",
-                            style="Dim.TLabel")
-            lbl.pack(pady=30)
-            self._b040_imgq_widgets.append(lbl)
-            self._b040_imgq_scroll.bind_scroll()
+            messagebox.showwarning("Warning", "No 040 B firmware loaded.")
             return
-
-        for target_reg in self._b040_imgq_regs:
+        if not messagebox.askyesno("Low Latency Preset (040 B)",
+                "Disable ALL video post-processing to minimize latency?\n\n"
+                "This will:\n"
+                "  • Turn off decoder sharpness, V peaking & H filter\n"
+                "  • Zero all CTI (color transient) coefficients\n"
+                "  • Reduce line buffer delay (saves ~0.9ms)\n"
+                "  • Set Y contrast/brightness to neutral\n"
+                "  • Disable dither\n\n"
+                "Only registers present in the 040 init table "
+                "will be modified.\n"
+                "You can fine-tune individual registers after applying."):
+            return
+        changed = 0
+        for reg, val, desc in self._B_LOW_LATENCY_REGS:
             entry = next((e for e in self.fw_040b.init_regs
-                          if e.reg == target_reg), None)
-            if not entry:
-                continue
-            info = REGISTER_INFO.get(target_reg, ("Unknown", ""))
-            name, desc = info
-            card = tk.Frame(parent, bg=C["bg2"], bd=0,
-                            highlightthickness=1,
-                            highlightbackground=C["border"])
-            card.pack(fill="x", pady=4)
-            self._b040_imgq_widgets.append(card)
-            tf2 = tk.Frame(card, bg=C["bg2"])
-            tf2.pack(fill="x", padx=12, pady=(8, 2))
-            is_mod = entry.value != entry.original
-            fg = C["mod"] if is_mod else C["accent"]
-            tk.Label(tf2, text=f"REG{target_reg:03X}", bg=C["bg2"],
-                     fg=C["dim"], font=self.font_mono_sm).pack(side="left")
-            tk.Label(tf2, text=f"  {name}", bg=C["bg2"], fg=fg,
-                     font=self.font_ui_bold).pack(side="left")
-            tk.Label(tf2, text=f"  {desc}", bg=C["bg2"], fg=C["dim"],
-                     font=self.font_ui).pack(side="left")
-            if is_mod:
-                tk.Label(tf2, text=f"  [Stock: 0x{entry.original:02X}]",
-                         bg=C["bg2"], fg=C["warn"],
-                         font=self.font_mono_sm).pack(side="right")
-            sf2 = tk.Frame(card, bg=C["bg2"])
-            sf2.pack(fill="x", padx=12, pady=(2, 8))
-            var = tk.IntVar(value=entry.value)
-            val_label = tk.Label(sf2,
-                text=f"0x{entry.value:02X} ({entry.value})",
-                bg=C["bg2"], fg=C["fg"], font=self.font_mono,
-                width=12, anchor="w")
+                          if e.reg == reg), None)
+            if entry and entry.value != val:
+                self.fw_040b.set_init_reg(entry, val)
+                changed += 1
+        self._refresh_b040_imgq()
+        self._update_status()
+        self._b040_imgq_preset_info.config(
+            text=f"  ⚡ Low latency applied: {changed} register(s) changed."
+                 f"  Post-processing disabled for minimum pipeline delay.",
+            fg=C["mod"])
 
-            def _on_slide(val, vl=val_label, v=var):
-                iv = int(float(val))
-                v.set(iv)
-                vl.config(text=f"0x{iv:02X} ({iv})")
+    def _apply_b040_stock_quality(self):
+        """Reset 040 B low-latency registers to stock values."""
+        if not self.fw_040b.init_regs:
+            messagebox.showwarning("Warning", "No 040 B firmware loaded.")
+            return
+        changed = 0
+        for reg, _, _ in self._B_LOW_LATENCY_REGS:
+            entry = next((e for e in self.fw_040b.init_regs
+                          if e.reg == reg), None)
+            if entry and entry.value != entry.original:
+                self.fw_040b.set_init_reg(entry, entry.original)
+                changed += 1
+        self._refresh_b040_imgq()
+        self._update_status()
+        self._b040_imgq_preset_info.config(
+            text=f"  ↩ Stock quality restored: {changed} register(s) reset.",
+            fg=C["dim"])
 
-            ttk.Scale(sf2, from_=0, to=255, orient="horizontal",
-                      variable=var, length=400,
-                      command=_on_slide).pack(side="left", padx=(0, 10))
-            val_label.pack(side="left", padx=(0, 10))
-
-            def _apply(e=entry, v=var):
-                self.fw_040b.set_init_reg(e, v.get())
-                self._refresh_b040_imgq()
-                self._update_status()
-
-            ttk.Button(sf2, text="Apply", command=_apply, width=6
-                       ).pack(side="left", padx=4)
-
-            def _reset_one(e=entry):
-                self.fw_040b.set_init_reg(e, e.original)
-                self._refresh_b040_imgq()
-                self._update_status()
-
-            ttk.Button(sf2, text="Reset", command=_reset_one, width=6
-                       ).pack(side="left")
-
-        self._b040_imgq_scroll.bind_scroll()
+    def _reset_all_b040_imgq(self):
+        """Reset ALL 040 imgq registers to stock."""
+        if not self.fw_040b.init_regs:
+            messagebox.showwarning("Warning", "No 040 B firmware loaded.")
+            return
+        all_regs = {r for _, _, regs in self._B_IMGQ_GROUPS for r in regs}
+        changed = 0
+        for entry in self.fw_040b.init_regs:
+            if entry.reg in all_regs and entry.value != entry.original:
+                self.fw_040b.set_init_reg(entry, entry.original)
+                changed += 1
+        self._refresh_b040_imgq()
+        self._update_status()
+        self._b040_imgq_preset_info.config(
+            text=f"  ↩ All registers reset to stock: {changed} changed.",
+            fg=C["dim"])
 
     # ── 040 B: Registers ──────────────────────────────────────────────
     def _build_b040_regs(self):
