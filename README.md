@@ -58,18 +58,6 @@ python skyzone_editor.py --b firmware/SKY04X_Pro_B_APP_V4.0.2.bin --a firmware/S
 
 ---
 
-## Firmware Files
-
-| File | Board | MCU | Size | Description |
-|------|-------|-----|------|-------------|
-| `SKY04X_Pro_B_APP_V4.0.2.bin` | B | TW8836 (8051) | 14.8 MB | Video processor, OSD, analog decoder |
-| `SKY04XPro_A_APP_V4.1.6.bin` | A | MK22FN256 (ARM) | 227,840 B | Display controller, HDMI Rx, LVDS bridge |
-| `SKY04XPro_A_APP_V4.1.7.bin` | A | MK22FN256 (ARM) | 228,864 B | Display controller, HDMI Rx, LVDS bridge |
-
-**⚠️ Firmware files are NOT included in this repo.** Extract them from your goggles' SPI flash or obtain from Skyzone support. The editor will auto-detect files placed in the `firmware/` directory.
-
----
-
 ## Frame Timing / FPS Presets
 
 The A board controls the OLED panel refresh rate via frame-period values stored as MOVW Thumb-2 immediates. The editor scans for these and provides one-click presets:
