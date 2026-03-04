@@ -711,6 +711,242 @@ class FirmwareAnalyzer:
 
 
 # ╔══════════════════════════════════════════════════════════════════════╗
+# ║  040 B BOARD — TW8836 (block-keyed XOR encoded firmware)           ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+class FirmwareAnalyzer040B:
+    """TW8836 B-board firmware for SKY04O Pro (040 series).
+
+    The 040 B firmware uses the same block-keyed XOR scheme as the A board:
+        key[i] = (0x55 + i // 512) & 0xFF
+    applied from raw file offset 0x210 (A_PAYLOAD_START).
+    """
+
+    PAYLOAD_START = 0x210
+    BLOCK_SIZE    = 512
+    XOR_BASE      = 0x55
+
+    def __init__(self):
+        self.raw: Optional[bytearray]  = None   # full encoded file
+        self.data: Optional[bytearray] = None   # decoded payload
+        self.original: Optional[bytes] = None   # snapshot for reset/diff
+        self.path: str = ""
+        self.is_flash: bool = True
+        self.delays:    List[DelayCall]    = []
+        self.init_regs: List[InitRegEntry] = []
+        self.mods:      List[Mod]          = []
+        self.init_table_offset: int = -1
+        self._flash_data = None              # kept for interface compat
+        self._mod_offsets: set = set()       # payload offsets written
+
+    # ── Encode / decode helpers ────────────────────────────────────────
+    def _key(self, payload_offset: int) -> int:
+        return (self.XOR_BASE + payload_offset // self.BLOCK_SIZE) & 0xFF
+
+    def _decode_payload(self, raw_bytes) -> bytearray:
+        """Fast block-XOR decode using bytes.translate()."""
+        payload_len = len(raw_bytes) - self.PAYLOAD_START
+        out = bytearray(payload_len)
+        BSIZ = self.BLOCK_SIZE
+        for blk in range((payload_len + BSIZ - 1) // BSIZ):
+            key = (self.XOR_BASE + blk) & 0xFF
+            tbl = bytes(i ^ key for i in range(256))
+            s = blk * BSIZ
+            e = min(s + BSIZ, payload_len)
+            chunk = bytes(raw_bytes[self.PAYLOAD_START + s:
+                                    self.PAYLOAD_START + e])
+            out[s:e] = chunk.translate(tbl)
+        return out
+
+    def _encode_back(self, payload_offset: int):
+        """Re-encode one decoded byte back into self.raw."""
+        key = self._key(payload_offset)
+        self.raw[self.PAYLOAD_START + payload_offset] = \
+            self.data[payload_offset] ^ key
+
+    def _write_decoded(self, poff: int, value: int):
+        """Write to decoded payload + keep raw in sync + track offset."""
+        self.data[poff] = value & 0xFF
+        self._encode_back(poff)
+        self._mod_offsets.add(poff)
+
+    # ── Load ──────────────────────────────────────────────────────────
+    def load(self, path: str):
+        with open(path, "rb") as f:
+            raw = f.read()
+        if len(raw) < self.PAYLOAD_START + 0x1000:
+            raise ValueError(f"File too small: {len(raw)} bytes")
+        if raw[0] != 0x04:
+            raise ValueError(
+                f"Not a Skyzone firmware (byte[0]=0x{raw[0]:02X})")
+        self.path = path
+        self.raw  = bytearray(raw)
+        self.data = self._decode_payload(raw)
+        self.original = bytes(self.data)
+        self._mod_offsets.clear()
+        self.delays.clear()
+        self.init_regs.clear()
+        self.mods.clear()
+        self.init_table_offset = -1
+        self._find_delays()
+        self._find_init_table()
+
+    # ── Bank name (compatibility) ──────────────────────────────────────
+    def get_bank(self, off: int) -> str:
+        return "MCU"
+
+    def _auto_delay_desc(self, off: int, ms: int) -> str:
+        return f"delay {ms}ms"
+
+    # ── Delay pattern search ──────────────────────────────────────────
+    def _find_delays(self):
+        """Find 8051 delay1ms() patterns using compiled regex (fast on 15MB)."""
+        import re
+        d = bytes(self.data)
+        pat = re.compile(b'\xe4\x7f([\x00-\xff])\x7e([\x00-\xff])\xfd\xfc')
+        for m in pat.finditer(d):
+            r7 = m.group(1)[0]
+            r6 = m.group(2)[0]
+            ms = r6 * 256 + r7
+            if 5 <= ms <= 30000:
+                off = m.start()
+                self.delays.append(DelayCall(
+                    offset=off + 1, value_ms=ms,
+                    r7_off=off + 2, r6_off=off + 4,
+                    bank="MCU",
+                    desc=KNOWN_DELAYS.get(off + 1, f"delay {ms}ms")))
+        self.delays.sort(key=lambda x: x.offset)
+
+    # ── Init table search ─────────────────────────────────────────────
+    def _find_init_table(self):
+        sig = bytes([0x00, 0x06, 0x06, 0x00, 0x07])
+        pos = self.data.find(sig)
+        if pos != -1:
+            self.init_table_offset = pos
+            self._parse_init_table_3byte(pos)
+
+    def _parse_init_table_3byte(self, start: int):
+        d = self.data
+        i = start
+        safety = 0
+        while i < min(len(d) - 2, start + 2100) and safety < 750:
+            safety += 1
+            hi, lo, val = d[i], d[i+1], d[i+2]
+            if hi == 0x0F and lo == 0xFF and val == 0xFF:
+                break
+            if hi > 0x04:
+                break
+            reg = (hi << 8) | lo
+            self.init_regs.append(InitRegEntry(
+                file_offset=i + 2, reg=reg, value=val, original=val))
+            i += 3
+
+    # ── Setters ───────────────────────────────────────────────────────
+    def set_delay(self, dc: DelayCall, new_ms: int):
+        new_ms = max(1, min(30000, new_ms))
+        old_r7 = self.data[dc.r7_off]
+        old_r6 = self.data[dc.r6_off]
+        r7 = new_ms & 0xFF
+        r6 = (new_ms >> 8) & 0xFF
+        self._write_decoded(dc.r7_off, r7)
+        self._write_decoded(dc.r6_off, r6)
+        self.mods.append(Mod(
+            dc.r7_off, bytes([old_r7, old_r6]), bytes([r7, r6]),
+            f"delay1ms({dc.value_ms}) → delay1ms({new_ms})"
+            f" @ 0x{dc.offset:05X}"))
+        dc.value_ms = new_ms
+
+    def set_init_reg(self, entry: InitRegEntry, new_val: int):
+        new_val = new_val & 0xFF
+        old = self.data[entry.file_offset]
+        self._write_decoded(entry.file_offset, new_val)
+        name = REGISTER_INFO.get(entry.reg, ("?", ""))[0]
+        self.mods.append(Mod(
+            entry.file_offset, bytes([old]), bytes([new_val]),
+            f"REG{entry.reg:03X} ({name}): 0x{old:02X} → 0x{new_val:02X}"))
+        entry.value = new_val
+
+    def set_byte(self, offset: int, new_val: int):
+        old = self.data[offset]
+        self._write_decoded(offset, new_val)
+        self.mods.append(Mod(
+            offset, bytes([old]), bytes([new_val & 0xFF]),
+            f"Byte @0x{offset:05X}: 0x{old:02X} → 0x{new_val:02X}"))
+
+    # ── Reset ─────────────────────────────────────────────────────────
+    def reset_all(self):
+        if not self.original:
+            return
+        # Restore each modified decoded byte and re-encode into raw
+        for poff in self._mod_offsets:
+            if 0 <= poff < len(self.original):
+                self.data[poff] = self.original[poff]
+                self._encode_back(poff)
+        # Also restore r6_off for delay mods (r6_off = r7_off + 2)
+        extra = set()
+        for m in self.mods:
+            if len(m.old) == 2:       # delay mod: stores [old_r7, old_r6]
+                poff2 = m.offset + 2  # r6_off = r7_off + 2
+                if poff2 not in self._mod_offsets:
+                    extra.add(poff2)
+        for poff in extra:
+            if 0 <= poff < len(self.original):
+                self.data[poff] = self.original[poff]
+                self._encode_back(poff)
+        self._mod_offsets.clear()
+        self.mods.clear()
+        self.delays.clear()
+        self.init_regs.clear()
+        self.init_table_offset = -1
+        self._find_delays()
+        self._find_init_table()
+
+    # ── Stats ─────────────────────────────────────────────────────────
+    def diff_count(self) -> int:
+        return len(self._mod_offsets)
+
+    def save_mcu(self, path: str):
+        """Save decoded payload (for inspection; raw 15 MB decoded)."""
+        with open(path, "wb") as f:
+            f.write(self.data)
+
+    def save_flash(self, path: str):
+        """Save full re-encoded firmware file."""
+        with open(path, "wb") as f:
+            f.write(self.raw)
+
+    def sha(self) -> str:
+        if not self.mods:
+            return self.sha_orig()
+        import json
+        s = json.dumps([(m.offset, list(m.new)) for m in self.mods])
+        return hashlib.sha256(s.encode()).hexdigest()[:16]
+
+    def sha_orig(self) -> str:
+        if not self.raw:
+            return ""
+        return hashlib.sha256(bytes(self.raw[:1024])).hexdigest()[:16]
+
+    def hex_dump(self, offset: int, length: int = 256) -> str:
+        if not self.data:
+            return ""
+        lines = []
+        end = min(offset + length, len(self.data))
+        orig = self.original
+        for addr in range(offset, end, 16):
+            row = self.data[addr:addr+16]
+            hx_parts = []
+            for j, bv in enumerate(row):
+                is_mod = (orig is not None and
+                          addr+j < len(orig) and bv != orig[addr+j])
+                hx_parts.append(f"[{bv:02X}]" if is_mod else f" {bv:02X} ")
+            hx = "".join(hx_parts)
+            asc = "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in row)
+            lines.append(f"{addr:05X}  {hx}  {asc}")
+        return "\n".join(lines)
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
 # ║  A BOARD — NXP Kinetis MK22FN256 (ARM Cortex-M4 Display Ctrl)     ║
 # ╚══════════════════════════════════════════════════════════════════════╝
 
@@ -741,9 +977,11 @@ PANEL_REGS: Dict[int, Tuple[str, str]] = {
     0x08: ("PANEL_STATE",           "Panel state / configuration data"),
     0x09: ("DISP_STATUS",          "Display status / diagnostic readback"),
     0x0A: ("GET_POWER_STATE",       "Read power state register"),
+    0x0B: ("GET_ADDR_MODE",          "Read address mode / scan direction"),
     0x0C: ("GET_PIXEL_FMT",         "Read pixel format register"),
     0x0D: ("GET_POWER_MODE",       "Read power mode / display state"),
     0x0E: ("GET_IMG_MODE",          "Read image display mode"),
+    0x0F: ("GET_DIAG_RESULT",        "Read self-diagnostic result / signal mode"),
     0x10: ("SLEEP_IN",             "Enter sleep mode (low power)"),
     0x11: ("SLEEP_OUT",            "Exit sleep mode (wait after write)"),
     0x12: ("PARTIAL_MODE_ON",      "Partial display mode enable"),
@@ -751,9 +989,11 @@ PANEL_REGS: Dict[int, Tuple[str, str]] = {
     0x15: ("PARTIAL_AREA",         "Partial area row start/end"),
     0x16: ("GAMMA_SET_A",          "Gamma correction voltage A"),
     0x17: ("GAMMA_REF_VOLT",       "Gamma reference voltage / gate output"),
+    0x18: ("READ_FRAME_CNT",         "Read frame count / display line status"),
     0x19: ("VCOM_CTRL_1",          "VCOM voltage control 1"),
     0x1A: ("VCOM_CTRL_2",          "VCOM voltage control 2"),
     0x1B: ("VCOM_OFFSET",           "VCOM offset / fine trim"),
+    0x1C: ("READ_ID4",               "Read display identification 4 (extended ID)"),
     0x1D: ("COL_ADDR_SET",         "Column address set"),
     0x1E: ("PIXEL_FORMAT",         "Pixel format (RGB / interface bits)"),
     0x1F: ("SELF_DIAG",            "Self-diagnostics result readback"),
@@ -762,9 +1002,11 @@ PANEL_REGS: Dict[int, Tuple[str, str]] = {
     0x22: ("ALL_PIX_OFF",           "All pixels off command"),
     0x23: ("PANEL_CFG",            "Panel configuration register"),
     0x24: ("PANEL_DRIVE",          "Panel drive strength"),
+    0x25: ("CTRL_DISP_WRITE",        "Write control display / CABC enable register"),
     0x26: ("GAMMA_SET",             "Gamma curve selection"),
     0x27: ("CONTRAST_CTRL",        "Contrast / brightness fine adjust"),
     0x28: ("DISP_OFF",              "Display off"),
+    0x29: ("DISP_ON",               "Display on command"),
     0x2A: ("COL_ADDR_START",        "Column address start"),
     0x2C: ("MEM_WRITE",             "Memory write start"),
     0x2E: ("MEM_READ",              "Memory read start"),
@@ -773,25 +1015,34 @@ PANEL_REGS: Dict[int, Tuple[str, str]] = {
     0x31: ("GATE_CTRL",            "Gate driver control"),
     0x32: ("SCROLL_AREA",          "Vertical scroll area definition"),
     0x33: ("SCROLL_START",         "Vertical scroll start address"),
+    0x34: ("TEAR_OFF",               "Tear effect line off"),
+    0x35: ("TEAR_ON",                "Tear effect line on / mode select"),
     0x36: ("MEM_ACCESS_CTRL",      "Memory access / scan direction (MADCTL)"),
     0x37: ("VSCROLL_ADDR",          "Vertical scroll start address"),
     0x38: ("IDLE_OFF",              "Idle mode off"),
     0x39: ("IDLE_ON",               "Idle mode on"),
     0x3C: ("DISP_TIMING",          "Display timing / blanking control"),
     0x40: ("GATE_SCAN_START",      "Gate scan start position / voltage"),
+    0x42: ("MEM_WRITE_CONT",         "Memory write continue / stream data"),
     0x43: ("GATE_CTRL_EXT",         "Gate control extended"),
     0x44: ("SET_TEAR_LINE",         "Set tear effect scanline"),
     0x45: ("GET_SCANLINE",         "Read current scan line position"),
+    0x46: ("SET_SCROLL_START",       "Set vertical scroll start address"),
     0x47: ("GET_BRIGHTNESS",       "Read current brightness level"),
+    0x48: ("READ_CTRL_DISPLAY",      "Read control display register / CABC state"),
     0x49: ("SRC_DRV_VOLTAGE",      "Source driver voltage adjust"),
     0x4B: ("SRC_DRV_CTRL",          "Source driver control"),
     0x4D: ("SRC_DRV_BIAS",          "Source driver bias level"),
     0x4E: ("SRC_DRV_FINE",          "Source driver fine adjust"),
     0x4F: ("PANEL_TIMING",          "Panel timing configuration"),
+    0x50: ("CABC_CTRL",             "Content adaptive brightness control enable"),
     0x51: ("WRITE_BRIGHTNESS",      "Write display brightness value"),
     0x52: ("READ_BRIGHTNESS",       "Read display brightness value"),
+    0x53: ("WRITE_CTRL_DISPLAY",    "Write CTRL_DISPLAY register (backlight/CABC)"),
     0x55: ("INTERFACE_PIXEL",      "Interface pixel mode select"),
     0x56: ("ADAPTIVE_CTRL",        "Adaptive brightness / CABC control"),
+    0x57: ("CABC_MIN_BRIGHT",        "CABC minimum brightness level"),
+    0x58: ("CABC_MIN_BRIGHT_EXT",    "CABC minimum brightness extended / still-image"),
     0x60: ("GAMMA_CH_0",           "Gamma channel 0 — voltage level"),
     0x61: ("GAMMA_CH_1",           "Gamma channel 1 — voltage level"),
     0x62: ("GAMMA_CH_2",           "Gamma channel 2 — voltage level"),
@@ -808,6 +1059,7 @@ PANEL_REGS: Dict[int, Tuple[str, str]] = {
     0x6F: ("FRAME_RATE_C",          "Frame rate control C"),
     0x70: ("GATE_DRV_CTRL",         "Gate driver control / scan mode"),
     0x72: ("GATE_OUT_EXT",         "Gate output extended / gamma trim"),
+    0x73: ("READ_ID_EXT",            "Read extended identification / register bank"),
     0x74: ("SRC_VOLTAGE_A",         "Source output voltage level A"),
     0x75: ("CONTRAST",             "Contrast control value"),
     0x76: ("SRC_OUT_LEVEL",        "Source output level trim"),
@@ -829,15 +1081,22 @@ PANEL_REGS: Dict[int, Tuple[str, str]] = {
     0x8D: ("GATE_TIMING_E",         "Gate timing control E"),
     0x8E: ("GATE_TIMING_B",        "Gate timing control B"),
     0x8F: ("GATE_TIMING_C",        "Gate timing control C"),
+    0x90: ("DSC_CTRL",              "Display stream compression control"),
+    0x91: ("DSC_MODE",              "Display stream compression mode / bits-per-pixel"),
     0x93: ("SRC_CLK_CTRL",         "Source clock control"),
+    0x95: ("DSC_PARAMS_A",           "Display stream compression parameters A"),
     0x96: ("POWER_GATE_A",          "Power / gate combined control A"),
+    0x97: ("DSC_PARAMS_B",           "Display stream compression parameters B"),
     0x98: ("POWER_CFG_A",          "Power configuration A"),
     0x99: ("POWER_CFG_B",          "Power configuration B"),
     0x9A: ("POWER_CFG_C",          "Power configuration C"),
+    0x9B: ("DSC_PARAMS_C",           "Display stream compression parameters C"),
     0x9C: ("POWER_TIMING",         "Power timing / sequencing"),
     0x9D: ("POWER_DRV_FINE",        "Power driver fine adjust"),
     0x9E: ("POWER_AMP",             "Power amplifier control"),
     0x9F: ("POWER_CFG_D",           "Power configuration D"),
+    0xA0: ("CHECKSUM_A",             "Image data checksum A / first checksum"),
+    0xA1: ("CHECKSUM_B",             "Image data checksum B / continue checksum"),
     0xA2: ("POWER_DRV_A",          "Power driver strength A"),
     0xA3: ("POWER_DRV_B",          "Power driver strength B"),
     0xA4: ("POWER_DRV_C",           "Power driver strength C"),
@@ -853,6 +1112,7 @@ PANEL_REGS: Dict[int, Tuple[str, str]] = {
     0xB0: ("POWER_SEQ_A",          "Power sequence control A"),
     0xB1: ("POWER_SEQ_B",          "Power sequence control B"),
     0xB3: ("INTF_TIMING",          "Interface timing control"),
+    0xB4: ("DISP_CTRL_EXT",          "Display control extended / backlight PWM mode"),
     0xB5: ("BLANKING_CTRL",         "Blanking porch control"),
     0xBA: ("VCOM_DRV",              "VCOM driving strength"),
     0xBB: ("VCOM_LEVEL",           "VCOM DC level adjust"),
@@ -864,6 +1124,7 @@ PANEL_REGS: Dict[int, Tuple[str, str]] = {
     0xC4: ("MFR_PWR_CTRL_4",       "Manufacturer power control 4"),
     0xC5: ("MFR_PWR_CTRL_5",       "Manufacturer power control 5"),
     0xC6: ("MFR_PWR_CTRL_6",       "Manufacturer power control 6"),
+    0xC7: ("MFR_PWR_CTRL_7",        "Manufacturer power control 7"),
     0xC8: ("MFR_GAMMA_A",          "Manufacturer gamma control A"),
     0xC9: ("MFR_GAMMA_B",          "Manufacturer gamma control B"),
     0xCA: ("MFR_GAMMA_C",          "Manufacturer gamma control C"),
@@ -900,6 +1161,7 @@ PANEL_REGS: Dict[int, Tuple[str, str]] = {
     0xEF: ("MFR_TIMING_D",         "Manufacturer timing control D"),
     0xF0: ("MFR_CMD_SET_A",        "Manufacturer command set enable A"),
     0xF1: ("MFR_CMD_SET_B",        "Manufacturer command set enable B"),
+    0xF2: ("MFR_TEST_B",             "Manufacturer test / calibration command B"),
     0xF3: ("MFR_SEQ_CTRL",         "Manufacturer sequence control"),
     0xF4: ("INTERFACE_CTRL",       "Interface / format control"),
     0xF5: ("MFR_PUMP_A",           "Manufacturer charge pump A"),
@@ -1204,6 +1466,7 @@ class FirmwareAnalyzerA:
         self.reset_vector: int = 0
         self.build_date: str = ""
         self.fw_version: str = ""
+        self.device_type: str = "X4Pro"  # 'X4Pro' or '040'
 
     # ── Address Conversions ────────────────────────────────────────────
     def payload_to_file(self, poff: int) -> int:
@@ -1231,9 +1494,11 @@ class FirmwareAnalyzerA:
             raise ValueError(f"File too small: {self.file_size} bytes")
         if self.file_size > A_MAX_FILE_SIZE:
             raise ValueError(f"File too large: {self.file_size} bytes")
-        if self.raw[0] != 0x04 or self.raw[3] != 0x02:
+        if self.raw[0] != 0x04 or self.raw[3] not in (0x00, 0x02):
             raise ValueError(f"Not a Skyzone A firmware: "
                              f"header={self.raw[:6].hex()}")
+        # byte[1]: 0x01 = SKY04X Pro, 0x10 = SKY04O Pro (040)
+        self.device_type = "040" if self.raw[1] == 0x10 else "X4Pro"
 
         # ── Block-keyed XOR decode ───────────────────────────────────
         # Key schedule: key[i] = (0x55 + floor(i / 512)) & 0xFF
@@ -1619,11 +1884,13 @@ class FirmwareAnalyzerA:
 # ╚══════════════════════════════════════════════════════════════════════╝
 
 class App:
-    def __init__(self, a_path: str = "", b_path: str = ""):
-        self.fw_b = FirmwareAnalyzer()
-        self.fw_a = FirmwareAnalyzerA()
+    def __init__(self, a_path: str = "", b_path: str = "",
+                 b040_path: str = ""):
+        self.fw_b    = FirmwareAnalyzer()
+        self.fw_a    = FirmwareAnalyzerA()
+        self.fw_040b = FirmwareAnalyzer040B()
         self.root = tk.Tk()
-        self.root.title(f"Skyzone SKY04X Pro Firmware Editor  v{VERSION}")
+        self.root.title(f"Skyzone SKY04X / SKY04O Pro Firmware Editor  v{VERSION}")
         self.root.geometry("1400x920")
         self.root.minsize(1000, 650)
         self.root.configure(bg=C["bg"])
@@ -1638,6 +1905,8 @@ class App:
             self._load_b(b_path)
         if a_path and os.path.isfile(a_path):
             self._load_a(a_path)
+        if b040_path and os.path.isfile(b040_path):
+            self._load_b040(b040_path)
 
     # ══════════════════════════════════════════════════════════════════
     # Fonts / Styles
@@ -1714,17 +1983,20 @@ class App:
         fm.add_command(label="  Open B Board MCU…",   command=self._open_b_mcu)
         fm.add_command(label="  Open B Board Flash…", command=self._open_b_flash)
         fm.add_command(label="  Open A Board FW…",    command=self._open_a_fw)
+        fm.add_command(label="  Open 040 B Board Flash…", command=self._open_b040_flash)
         fm.add_separator()
         fm.add_command(label="  Save B Patched MCU…",   command=self._save_b_mcu)
         fm.add_command(label="  Save B Patched Flash…", command=self._save_b_flash)
         fm.add_command(label="  Save A Patched FW…",    command=self._save_a)
+        fm.add_command(label="  Save 040 B Patched Flash…", command=self._save_b040_flash)
         fm.add_separator()
-        fm.add_command(label="  Export B Patch Log…", command=self._export_b_log)
-        fm.add_command(label="  Export A Patch Log…", command=self._export_a_log)
+        fm.add_command(label="  Export B Patch Log…",    command=self._export_b_log)
+        fm.add_command(label="  Export A Patch Log…",    command=self._export_a_log)
+        fm.add_command(label="  Export 040 B Patch Log…", command=self._export_b040_log)
         fm.add_separator()
         fm.add_command(label="  Exit", command=self.root.quit)
         mb.add_cascade(label=" File ", menu=fm)
-        # Presets (B)
+        # Presets
         pm = tk.Menu(mb, tearoff=0, bg=C["bg2"], fg=C["fg"],
                      activebackground=C["accent"], activeforeground="#000",
                      font=self.font_ui)
@@ -1732,6 +2004,8 @@ class App:
                        command=self._reset_b)
         pm.add_command(label="  Reset A Board",
                        command=self._reset_a)
+        pm.add_command(label="  Reset 040 B Board",
+                       command=self._reset_b040)
         pm.add_separator()
         pm.add_command(label="  B: Conservative Delays (0.5×)",
                        command=lambda: self._preset_b_delays(0.5))
@@ -1739,6 +2013,11 @@ class App:
                        command=lambda: self._preset_b_delays(0.1))
         pm.add_command(label="  B: High Sharpness",
                        command=self._preset_b_sharp)
+        pm.add_separator()
+        pm.add_command(label="  040 B: Conservative Delays (0.5×)",
+                       command=lambda: self._preset_b040_delays(0.5))
+        pm.add_command(label="  040 B: Aggressive Delays (0.1×)",
+                       command=lambda: self._preset_b040_delays(0.1))
         mb.add_cascade(label=" Presets ", menu=pm)
         self.root.config(menu=mb)
         self.root.bind("<Control-s>", lambda e: self._save_current())
@@ -1802,6 +2081,31 @@ class App:
         self._build_a_hex()
         self._build_a_patch()
 
+        # ── 040 B Board ───────────────────────────────────────────────
+        b040_frame = ttk.Frame(self.board_nb)
+        self.board_nb.add(b040_frame, text="  🆕 040 B Board — TW8836  ")
+        self.b040_nb = ttk.Notebook(b040_frame)
+        self.b040_nb.pack(fill="both", expand=True)
+
+        for attr, title in [
+            ("_b040_tab_overview", "  Overview  "),
+            ("_b040_tab_delays",   "  ⏱ Delays  "),
+            ("_b040_tab_imgq",     "  🎨 Image Quality  "),
+            ("_b040_tab_regs",     "  📋 Registers  "),
+            ("_b040_tab_hex",      "  💾 Hex View  "),
+            ("_b040_tab_patch",    "  📦 Patch Output  "),
+        ]:
+            f = ttk.Frame(self.b040_nb)
+            setattr(self, attr, f)
+            self.b040_nb.add(f, text=title)
+
+        self._build_b040_overview()
+        self._build_b040_delays()
+        self._build_b040_imgq()
+        self._build_b040_regs()
+        self._build_b040_hex()
+        self._build_b040_patch()
+
         self.board_nb.bind("<<NotebookTabChanged>>",
                            lambda e: self._update_status())
 
@@ -1844,7 +2148,7 @@ class App:
                 self.status_lbl.config(text="B Board: No file loaded",
                                        fg=C["dim"])
                 self.status_mods.config(text="")
-        else:  # A Board
+        elif sel == 1:  # A Board
             fw = self.fw_a
             if fw.raw:
                 name = Path(fw.path).name
@@ -1860,6 +2164,23 @@ class App:
                     fg=C["mod"] if dc else C["dim"])
             else:
                 self.status_lbl.config(text="A Board: No file loaded",
+                                       fg=C["dim"])
+                self.status_mods.config(text="")
+        elif sel == 2:  # 040 B Board
+            fw = self.fw_040b
+            if fw.data:
+                name = Path(fw.path).name
+                dc = fw.diff_count()
+                self.status_lbl.config(
+                    text=f"040 B Board: {name}  |  {len(fw.data):,} bytes  "
+                         f"|  {len(fw.delays)} delays  "
+                         f"|  {len(fw.init_regs)} regs",
+                    fg=C["fg"])
+                self.status_mods.config(
+                    text=f"✏️ {dc} bytes modified" if dc else "No changes",
+                    fg=C["mod"] if dc else C["dim"])
+            else:
+                self.status_lbl.config(text="040 B Board: No file loaded",
                                        fg=C["dim"])
                 self.status_mods.config(text="")
 
@@ -2406,7 +2727,9 @@ class App:
         ds = sum(1 for s in fw.strings if s.section == "data")
         lines = [
             f"{'=' * 72}",
-            f"  SKY04X Pro — A Board (MK22F) Firmware Overview",
+            f"  SKY04X Pro — A Board (MK22F) Firmware Overview"
+            if fw.device_type == "X4Pro" else
+            f"  SKY04O Pro (040) — A Board (MK22F) Firmware Overview",
             f"{'=' * 72}",
             "",
             f"  File:           {Path(fw.path).name}",
@@ -2843,6 +3166,513 @@ class App:
         txt.config(state="disabled")
 
     # ══════════════════════════════════════════════════════════════════
+    #  040 B BOARD TABS
+    # ══════════════════════════════════════════════════════════════════
+
+    # ── 040 B: Overview ───────────────────────────────────────────────
+    def _build_b040_overview(self):
+        f = self._b040_tab_overview
+        ttk.Label(f, text="TW8836 (040 B Board) — SKY04O Pro Video Processor",
+                  style="H.TLabel").pack(padx=16, pady=(12, 4), anchor="w")
+        ttk.Label(f, text="8051 MCU — block-keyed XOR encoded firmware  "
+                  "(same key schedule as A board)",
+                  style="Dim.TLabel").pack(padx=16, anchor="w")
+        ttk.Separator(f).pack(fill="x", padx=16, pady=10)
+        self.b040_ov_text = tk.Text(f, bg=C["bg2"], fg=C["fg"],
+                                    font=self.font_mono, relief="flat",
+                                    padx=16, pady=12,
+                                    insertbackground=C["fg"],
+                                    state="disabled", highlightthickness=1,
+                                    highlightbackground=C["border"])
+        self.b040_ov_text.pack(fill="both", expand=True, padx=8, pady=8)
+        bf = ttk.Frame(f)
+        bf.pack(padx=16, pady=8, anchor="w")
+        ttk.Button(bf, text="Open 040 B Board Flash…",
+                   command=self._open_b040_flash).pack(side="left", padx=(0,8))
+
+    def _refresh_b040_overview(self):
+        t = self.b040_ov_text
+        t.config(state="normal")
+        t.delete("1.0", "end")
+        fw = self.fw_040b
+        if not fw.data:
+            t.insert("end", "  No file loaded.\n\n"
+                     "  Use File → Open 040 B Board Flash to load the "
+                     "SKY04O_Pro_B firmware.")
+            t.config(state="disabled")
+            return
+        size_mb = len(fw.raw) / 1_048_576
+        lines = [
+            f"  File:              {fw.path}",
+            f"  Raw size:          {len(fw.raw):,} bytes ({size_mb:.2f} MB)",
+            f"  Decoded payload:   {len(fw.data):,} bytes",
+            f"  Encoding:          Block-keyed XOR  "
+            f"(key = 0x55 + block#, block = 512 B)",
+            f"  Header ID:         {bytes(fw.raw[:6]).hex(' ')}",
+            f"  SHA256 (header):   {fw.sha_orig()}",
+            "",
+            f"  ── Analysis ─────────────────────────────────────────────",
+            f"  delay1ms() call sites found: {len(fw.delays)}",
+            f"  Init register entries:       {len(fw.init_regs)}",
+        ]
+        if fw.init_table_offset >= 0:
+            lines.append(
+                f"  Init table offset (decoded): 0x{fw.init_table_offset:05X}")
+        lines += [
+            f"  Modifications:               {fw.diff_count()} bytes changed",
+            "",
+            f"  ── Delay Summary ────────────────────────────────────────",
+        ]
+        if fw.delays:
+            dc = Counter(d.value_ms for d in fw.delays)
+            for ms, cnt in sorted(dc.items(), reverse=True):
+                lines.append(f"  delay1ms({ms:>6}):  {cnt:>3} call site(s)")
+        else:
+            lines.append("  (none found)")
+        t.insert("end", "\n".join(lines))
+        t.config(state="disabled")
+
+    # ── 040 B: Delays ─────────────────────────────────────────────────
+    def _build_b040_delays(self):
+        f = self._b040_tab_delays
+        ttk.Label(f, text="Timing Delays — delay1ms() Call Sites (040 B)",
+                  style="H.TLabel").pack(padx=16, pady=(12, 4), anchor="w")
+        ttk.Label(f, text="Modify stabilization/settling delays. "
+                  "Lower = faster switching, but may cause instability.",
+                  style="Dim.TLabel").pack(padx=16, anchor="w")
+        fb = ttk.Frame(f)
+        fb.pack(fill="x", padx=16, pady=8)
+        ttk.Label(fb, text="Filter:").pack(side="left")
+        self.b040_delay_filter = tk.StringVar(value="all")
+        for txt, val in [("All", "all"), ("≥100ms", "100"),
+                         ("≥1000ms", "1000"), ("Modified", "mod")]:
+            ttk.Radiobutton(fb, text=txt, variable=self.b040_delay_filter,
+                            value=val, command=self._refresh_b040_delays
+                            ).pack(side="left", padx=6)
+        ttk.Button(fb, text="Halve All ≥100ms",
+                   command=lambda: self._bulk_b040_delay(0.5)
+                   ).pack(side="right", padx=4)
+        ttk.Button(fb, text="Reset Delays",
+                   command=self._reset_b040_delays).pack(side="right", padx=4)
+        self._b040_delay_scroll = ScrollFrame(f)
+        self._b040_delay_scroll.pack(fill="both", expand=True,
+                                     padx=16, pady=(0, 8))
+        self._b040_delay_widgets: List[tk.Widget] = []
+
+    def _refresh_b040_delays(self):
+        for w in self._b040_delay_widgets:
+            w.destroy()
+        self._b040_delay_widgets.clear()
+        parent = self._b040_delay_scroll.inner
+
+        if not self.fw_040b.data:
+            lbl = ttk.Label(parent, text="No firmware loaded",
+                            style="Dim.TLabel")
+            lbl.pack(pady=20)
+            self._b040_delay_widgets.append(lbl)
+            self._b040_delay_scroll.bind_scroll()
+            return
+
+        filt = self.b040_delay_filter.get()
+        hdr = ttk.Frame(parent)
+        hdr.pack(fill="x", pady=(0, 4))
+        for txt, w in [("Offset", 10), ("Value(ms)", 10),
+                       ("Adjust", 28), ("", 8), ("Description", 40)]:
+            ttk.Label(hdr, text=txt, style="Dim.TLabel", width=w,
+                      font=self.font_ui_bold).pack(side="left", padx=2)
+        self._b040_delay_widgets.append(hdr)
+
+        for dc in self.fw_040b.delays:
+            if filt == "100"  and dc.value_ms < 100:
+                continue
+            if filt == "1000" and dc.value_ms < 1000:
+                continue
+            if filt == "mod"  and dc.value_ms == dc.original_ms:
+                continue
+            row = ttk.Frame(parent)
+            row.pack(fill="x", pady=1)
+            self._b040_delay_widgets.append(row)
+            is_mod = dc.value_ms != dc.original_ms
+            style = "Mod.TLabel" if is_mod else "TLabel"
+            ttk.Label(row, text=f"0x{dc.offset:06X}",
+                      font=self.font_mono_sm, width=10,
+                      style=style).pack(side="left", padx=2)
+            var = tk.IntVar(value=dc.value_ms)
+            ttk.Spinbox(row, from_=1, to=30000, width=7,
+                        textvariable=var,
+                        font=self.font_mono_sm).pack(side="left", padx=2)
+            ttk.Scale(row, from_=1,
+                      to=max(5000, dc.original_ms * 2),
+                      orient="horizontal", length=200,
+                      variable=var).pack(side="left", padx=4)
+
+            def _apply(d=dc, v=var):
+                self.fw_040b.set_delay(d, v.get())
+                self._refresh_b040_delays()
+                self._update_status()
+            ttk.Button(row, text="Set", command=_apply, width=4
+                       ).pack(side="left", padx=2)
+            desc = dc.desc or ""
+            if is_mod:
+                desc = f"[MOD {dc.original_ms}→{dc.value_ms}] " + desc
+            ttk.Label(row, text=desc, font=self.font_ui, width=45,
+                      style=style, anchor="w").pack(side="left", padx=4)
+
+        self._b040_delay_scroll.bind_scroll()
+
+    def _bulk_b040_delay(self, factor: float):
+        if not self.fw_040b.data:
+            return
+        for dc in self.fw_040b.delays:
+            if dc.value_ms >= 100:
+                self.fw_040b.set_delay(dc, max(1, int(dc.value_ms * factor)))
+        self._refresh_b040_delays()
+        self._update_status()
+
+    def _reset_b040_delays(self):
+        if not self.fw_040b.data:
+            return
+        changed = [dc for dc in self.fw_040b.delays
+                   if dc.value_ms != dc.original_ms]
+        for dc in changed:
+            self.fw_040b.set_delay(dc, dc.original_ms)
+        self._refresh_b040_delays()
+        self._update_status()
+
+    # ── 040 B: Image Quality ──────────────────────────────────────────
+    def _build_b040_imgq(self):
+        f = self._b040_tab_imgq
+        ttk.Label(f, text="Image Quality — Decoder Init Registers (040 B)",
+                  style="H.TLabel").pack(padx=16, pady=(12, 4), anchor="w")
+        ttk.Label(f, text="Adjust picture quality set during init. "
+                  "Changes take effect on next boot.",
+                  style="Dim.TLabel").pack(padx=16, anchor="w")
+        ttk.Separator(f).pack(fill="x", padx=16, pady=10)
+        self._b040_imgq_scroll = ScrollFrame(f)
+        self._b040_imgq_scroll.pack(fill="both", expand=True,
+                                    padx=16, pady=(0, 8))
+        self._b040_imgq_widgets: List[tk.Widget] = []
+        self._b040_imgq_regs = [0x110, 0x111, 0x112, 0x113, 0x114, 0x10C,
+                                 0x117, 0x20B, 0x210, 0x215, 0x21C,
+                                 0x281, 0x282, 0x283]
+
+    def _refresh_b040_imgq(self):
+        for w in self._b040_imgq_widgets:
+            w.destroy()
+        self._b040_imgq_widgets.clear()
+        parent = self._b040_imgq_scroll.inner
+
+        if not self.fw_040b.init_regs:
+            lbl = ttk.Label(parent, text="No init register table found.\n"
+                            "Load a 040 B firmware first.",
+                            style="Dim.TLabel")
+            lbl.pack(pady=30)
+            self._b040_imgq_widgets.append(lbl)
+            self._b040_imgq_scroll.bind_scroll()
+            return
+
+        for target_reg in self._b040_imgq_regs:
+            entry = next((e for e in self.fw_040b.init_regs
+                          if e.reg == target_reg), None)
+            if not entry:
+                continue
+            info = REGISTER_INFO.get(target_reg, ("Unknown", ""))
+            name, desc = info
+            card = tk.Frame(parent, bg=C["bg2"], bd=0,
+                            highlightthickness=1,
+                            highlightbackground=C["border"])
+            card.pack(fill="x", pady=4)
+            self._b040_imgq_widgets.append(card)
+            tf2 = tk.Frame(card, bg=C["bg2"])
+            tf2.pack(fill="x", padx=12, pady=(8, 2))
+            is_mod = entry.value != entry.original
+            fg = C["mod"] if is_mod else C["accent"]
+            tk.Label(tf2, text=f"REG{target_reg:03X}", bg=C["bg2"],
+                     fg=C["dim"], font=self.font_mono_sm).pack(side="left")
+            tk.Label(tf2, text=f"  {name}", bg=C["bg2"], fg=fg,
+                     font=self.font_ui_bold).pack(side="left")
+            tk.Label(tf2, text=f"  {desc}", bg=C["bg2"], fg=C["dim"],
+                     font=self.font_ui).pack(side="left")
+            if is_mod:
+                tk.Label(tf2, text=f"  [Stock: 0x{entry.original:02X}]",
+                         bg=C["bg2"], fg=C["warn"],
+                         font=self.font_mono_sm).pack(side="right")
+            sf2 = tk.Frame(card, bg=C["bg2"])
+            sf2.pack(fill="x", padx=12, pady=(2, 8))
+            var = tk.IntVar(value=entry.value)
+            val_label = tk.Label(sf2,
+                text=f"0x{entry.value:02X} ({entry.value})",
+                bg=C["bg2"], fg=C["fg"], font=self.font_mono,
+                width=12, anchor="w")
+
+            def _on_slide(val, vl=val_label, v=var):
+                iv = int(float(val))
+                v.set(iv)
+                vl.config(text=f"0x{iv:02X} ({iv})")
+
+            ttk.Scale(sf2, from_=0, to=255, orient="horizontal",
+                      variable=var, length=400,
+                      command=_on_slide).pack(side="left", padx=(0, 10))
+            val_label.pack(side="left", padx=(0, 10))
+
+            def _apply(e=entry, v=var):
+                self.fw_040b.set_init_reg(e, v.get())
+                self._refresh_b040_imgq()
+                self._update_status()
+
+            ttk.Button(sf2, text="Apply", command=_apply, width=6
+                       ).pack(side="left", padx=4)
+
+            def _reset_one(e=entry):
+                self.fw_040b.set_init_reg(e, e.original)
+                self._refresh_b040_imgq()
+                self._update_status()
+
+            ttk.Button(sf2, text="Reset", command=_reset_one, width=6
+                       ).pack(side="left")
+
+        self._b040_imgq_scroll.bind_scroll()
+
+    # ── 040 B: Registers ──────────────────────────────────────────────
+    def _build_b040_regs(self):
+        f = self._b040_tab_regs
+        ttk.Label(f, text="Init Register Table — All Entries (040 B)",
+                  style="H.TLabel").pack(padx=16, pady=(12, 4), anchor="w")
+        cols = ("offset", "register", "name", "value", "stock", "description")
+        tf = ttk.Frame(f)
+        tf.pack(fill="both", expand=True, padx=16, pady=8)
+        self.b040_reg_tree = ttk.Treeview(tf, columns=cols, show="headings",
+                                           height=24)
+        for col, txt, w in [
+            ("offset", "Offset", 80), ("register", "Register", 90),
+            ("name", "Name", 160), ("value", "Value", 80),
+            ("stock", "Stock", 80), ("description", "Description", 300),
+        ]:
+            self.b040_reg_tree.heading(col, text=txt)
+            self.b040_reg_tree.column(col, width=w, minwidth=50)
+        sb = ttk.Scrollbar(tf, orient="vertical",
+                            command=self.b040_reg_tree.yview)
+        self.b040_reg_tree.configure(yscrollcommand=sb.set)
+        self.b040_reg_tree.pack(fill="both", expand=True, side="left")
+        sb.pack(fill="y", side="right")
+        self.b040_reg_tree.bind("<MouseWheel>",
+            lambda e: self.b040_reg_tree.yview_scroll(
+                int(-1*(e.delta/120)), "units"))
+        ef = ttk.LabelFrame(f, text=" Edit Selected Register ")
+        ef.pack(fill="x", padx=16, pady=(0, 8))
+        inner = ttk.Frame(ef)
+        inner.pack(padx=8, pady=8)
+        ttk.Label(inner, text="New value (0-255):").pack(side="left")
+        self.b040_reg_edit_var = tk.IntVar()
+        ttk.Spinbox(inner, from_=0, to=255, width=6,
+                    textvariable=self.b040_reg_edit_var,
+                    font=self.font_mono).pack(side="left", padx=6)
+        ttk.Button(inner, text="Apply",
+                   command=self._apply_b040_reg_edit).pack(side="left", padx=4)
+
+    def _refresh_b040_regs(self):
+        tree = self.b040_reg_tree
+        tree.delete(*tree.get_children())
+        for entry in self.fw_040b.init_regs:
+            info = REGISTER_INFO.get(entry.reg, ("", ""))
+            is_mod = entry.value != entry.original
+            tag = "mod" if is_mod else ""
+            tree.insert("", "end", values=(
+                f"0x{entry.file_offset:06X}",
+                f"REG{entry.reg:03X}",
+                info[0],
+                f"0x{entry.value:02X}" +
+                    (f" ← 0x{entry.original:02X}" if is_mod else ""),
+                f"0x{entry.original:02X}",
+                info[1],
+            ), tags=(tag,))
+        tree.tag_configure("mod", foreground=C["mod"])
+
+    def _apply_b040_reg_edit(self):
+        sel = self.b040_reg_tree.selection()
+        if not sel:
+            return
+        item = self.b040_reg_tree.item(sel[0])
+        off_str = item["values"][0]
+        offset = int(off_str, 16)
+        entry = next((e for e in self.fw_040b.init_regs
+                      if e.file_offset == offset), None)
+        if entry:
+            self.fw_040b.set_init_reg(entry, self.b040_reg_edit_var.get())
+            self._refresh_b040_regs()
+            self._refresh_b040_imgq()
+            self._update_status()
+
+    # ── 040 B: Hex View ───────────────────────────────────────────────
+    def _build_b040_hex(self):
+        f = self._b040_tab_hex
+        ttk.Label(f, text="Hex Viewer (Decoded Payload) — 040 B",
+                  style="H.TLabel").pack(padx=16, pady=(12, 4), anchor="w")
+        nav = ttk.Frame(f)
+        nav.pack(fill="x", padx=16, pady=4)
+        ttk.Label(nav, text="Offset:").pack(side="left")
+        self.b040_hex_offset = tk.StringVar(value="0x00000")
+        ttk.Entry(nav, textvariable=self.b040_hex_offset, width=10,
+                  font=self.font_mono).pack(side="left", padx=4)
+        ttk.Label(nav, text="Bytes:").pack(side="left", padx=(10, 0))
+        self.b040_hex_size = tk.StringVar(value="512")
+        ttk.Entry(nav, textvariable=self.b040_hex_size, width=6,
+                  font=self.font_mono).pack(side="left", padx=4)
+        ttk.Button(nav, text="Go",
+                   command=self._refresh_b040_hex).pack(side="left", padx=4)
+        ttk.Button(nav, text="Go to Init Table",
+                   command=self._hex_b040_goto_init).pack(side="left", padx=4)
+        qf = ttk.Frame(f)
+        qf.pack(fill="x", padx=16, pady=2)
+        ttk.Label(qf, text="Jump:", style="Dim.TLabel").pack(side="left")
+        for name2, off in [("Strings", 0x0A5), ("Init Table", 0x5443),
+                           ("First Delay", 0xFD4F)]:
+            ttk.Button(qf, text=name2,
+                       command=lambda o=off: self._hex_b040_goto(o)
+                       ).pack(side="left", padx=3)
+        self.b040_hex_text = tk.Text(f, bg=C["bg2"], fg=C["fg"],
+                                     font=self.font_mono, relief="flat",
+                                     state="disabled",
+                                     insertbackground=C["fg"],
+                                     highlightthickness=1,
+                                     highlightbackground=C["border"],
+                                     selectbackground=C["sel"])
+        self.b040_hex_text.pack(fill="both", expand=True, padx=16, pady=8)
+        self.b040_hex_text.tag_configure("modified", foreground=C["mod"])
+        self.b040_hex_text.tag_configure("header", foreground=C["dim"])
+        eb = ttk.Frame(f)
+        eb.pack(fill="x", padx=16, pady=(0, 8))
+        ttk.Label(eb, text="Edit byte at offset:").pack(side="left")
+        self.b040_hex_edit_off = tk.StringVar()
+        ttk.Entry(eb, textvariable=self.b040_hex_edit_off, width=10,
+                  font=self.font_mono).pack(side="left", padx=4)
+        ttk.Label(eb, text="New value:").pack(side="left")
+        self.b040_hex_edit_val = tk.StringVar()
+        ttk.Entry(eb, textvariable=self.b040_hex_edit_val, width=5,
+                  font=self.font_mono).pack(side="left", padx=4)
+        ttk.Button(eb, text="Write",
+                   command=self._hex_b040_write).pack(side="left", padx=4)
+
+    def _refresh_b040_hex(self):
+        if not self.fw_040b.data:
+            return
+        try:
+            off = int(self.b040_hex_offset.get(), 0)
+            sz  = int(self.b040_hex_size.get(), 0)
+        except ValueError:
+            return
+        txt = self.b040_hex_text
+        txt.config(state="normal")
+        txt.delete("1.0", "end")
+        d = self.fw_040b.data
+        orig = self.fw_040b.original
+        end = min(off + sz, len(d))
+        for addr in range(off, end, 16):
+            row = d[addr:addr+16]
+            txt.insert("end", f"{addr:06X}  ", "header")
+            for j, b in enumerate(row):
+                is_mod = (orig is not None and
+                          addr+j < len(orig) and b != orig[addr+j])
+                tag = "modified" if is_mod else ""
+                txt.insert("end", f"{b:02X} ", tag)
+            if len(row) < 16:
+                txt.insert("end", "   " * (16 - len(row)))
+            txt.insert("end", " ")
+            for b in row:
+                txt.insert("end", chr(b) if 0x20 <= b < 0x7F else ".")
+            txt.insert("end", "\n")
+        txt.config(state="disabled")
+
+    def _hex_b040_goto(self, offset: int):
+        self.b040_hex_offset.set(f"0x{offset:06X}")
+        self._refresh_b040_hex()
+
+    def _hex_b040_goto_init(self):
+        if self.fw_040b.init_table_offset >= 0:
+            self._hex_b040_goto(self.fw_040b.init_table_offset)
+
+    def _hex_b040_write(self):
+        if not self.fw_040b.data:
+            return
+        try:
+            off = int(self.b040_hex_edit_off.get(), 0)
+            val = int(self.b040_hex_edit_val.get(), 0)
+        except ValueError:
+            messagebox.showerror("Error", "Invalid offset or value")
+            return
+        if 0 <= off < len(self.fw_040b.data) and 0 <= val <= 255:
+            self.fw_040b.set_byte(off, val)
+            self._refresh_b040_hex()
+            self._update_status()
+
+    # ── 040 B: Patch Output ───────────────────────────────────────────
+    def _build_b040_patch(self):
+        f = self._b040_tab_patch
+        ttk.Label(f, text="Patch Output — Changes Summary (040 B)",
+                  style="H.TLabel").pack(padx=16, pady=(12, 4), anchor="w")
+        bf = ttk.Frame(f)
+        bf.pack(fill="x", padx=16, pady=8)
+        ttk.Button(bf, text="Save Patched Flash…",
+                   command=self._save_b040_flash,
+                   style="Accent.TButton").pack(side="left", padx=4)
+        ttk.Button(bf, text="Export Log…",
+                   command=self._export_b040_log).pack(side="left", padx=4)
+        ttk.Button(bf, text="Refresh",
+                   command=self._refresh_b040_patch).pack(side="right", padx=4)
+        self.b040_patch_text = tk.Text(f, bg=C["bg2"], fg=C["fg"],
+                                       font=self.font_mono, relief="flat",
+                                       state="disabled",
+                                       insertbackground=C["fg"],
+                                       highlightthickness=1,
+                                       highlightbackground=C["border"])
+        self.b040_patch_text.pack(fill="both", expand=True, padx=16,
+                                  pady=(0, 8))
+        self.b040_patch_text.tag_configure("header", foreground=C["accent"])
+        self.b040_patch_text.tag_configure("add",    foreground=C["ok"])
+        self.b040_patch_text.tag_configure("del",    foreground=C["err"])
+        self.b040_patch_text.tag_configure("info",   foreground=C["dim"])
+
+    def _refresh_b040_patch(self):
+        txt = self.b040_patch_text
+        txt.config(state="normal")
+        txt.delete("1.0", "end")
+        fw = self.fw_040b
+        if not fw.data:
+            txt.insert("end", "No firmware loaded.", "info")
+            txt.config(state="disabled")
+            return
+        dc = fw.diff_count()
+        txt.insert("end", "═══ 040 B Board Patch Summary ═══\n", "header")
+        txt.insert("end", f"File:            {fw.path}\n", "info")
+        txt.insert("end", f"Header SHA256:   {fw.sha_orig()}\n", "info")
+        txt.insert("end", f"Bytes changed:   {dc}\n", "info")
+        txt.insert("end", f"Modifications:   {len(fw.mods)}\n\n", "info")
+        if not fw.mods:
+            txt.insert("end", "No modifications applied.\n", "info")
+        else:
+            txt.insert("end", "═══ Change Log ═══\n", "header")
+            for i, mod in enumerate(fw.mods, 1):
+                txt.insert("end", f"\n  [{i}] {mod.desc}\n")
+                txt.insert("end",
+                           f"      Decoded offset: 0x{mod.offset:06X}\n",
+                           "info")
+                txt.insert("end",
+                           f"      Old:  {mod.old.hex(' ')}\n", "del")
+                txt.insert("end",
+                           f"      New:  {mod.new.hex(' ')}\n", "add")
+        txt.config(state="disabled")
+
+    # ── 040 B: refresh all ────────────────────────────────────────────
+    def _refresh_b040_all(self):
+        self._refresh_b040_overview()
+        self._refresh_b040_delays()
+        self._refresh_b040_imgq()
+        self._refresh_b040_regs()
+        self._refresh_b040_hex()
+        self._refresh_b040_patch()
+        self._update_status()
+
+    # ══════════════════════════════════════════════════════════════════
     #  HELPERS
     # ══════════════════════════════════════════════════════════════════
 
@@ -2895,6 +3725,15 @@ class App:
         if path:
             self._load_b(path)
 
+    def _open_b040_flash(self):
+        path = filedialog.askopenfilename(
+            title="Open SKY04O Pro B Board Firmware",
+            filetypes=[("BIN files", "*.bin"), ("All files", "*.*")],
+            initialdir=str(Path(self.fw_040b.path).parent)
+                        if self.fw_040b.path else ".")
+        if path:
+            self._load_b040(path)
+
     def _open_a_fw(self):
         path = filedialog.askopenfilename(
             title="Open A Board Firmware",
@@ -2914,6 +3753,23 @@ class App:
         self._refresh_b_all()
         self.board_nb.select(0)  # Switch to B board tab
 
+    def _load_b040(self, path: str):
+        try:
+            # Show a progress dialog since decoding 15 MB takes a moment
+            self.root.config(cursor="watch")
+            self.root.update()
+            self.fw_040b.load(path)
+        except Exception as e:
+            self.root.config(cursor="")
+            messagebox.showerror("Error",
+                                 f"Failed to load 040 B firmware: {e}")
+            return
+        finally:
+            self.root.config(cursor="")
+        self._auto_backup(path)
+        self._refresh_b040_all()
+        self.board_nb.select(2)  # Switch to 040 B tab
+
     def _load_a(self, path: str):
         try:
             self.fw_a.load(path)
@@ -2932,7 +3788,7 @@ class App:
             shutil.copy2(str(src), str(backup_path))
 
     def _get_output_dir(self) -> Path:
-        for fw_path in [self.fw_b.path, self.fw_a.path]:
+        for fw_path in [self.fw_b.path, self.fw_a.path, self.fw_040b.path]:
             if fw_path:
                 p = Path(fw_path).resolve()
                 for parent in [p.parent, p.parent.parent,
@@ -3027,8 +3883,81 @@ class App:
             return
         if sel == 0:
             self._save_b_mcu()
+        elif sel == 2:
+            self._save_b040_flash()
         else:
             self._save_a()
+
+    def _save_b040_flash(self):
+        if not self.fw_040b.data:
+            return
+        if self.fw_040b.diff_count() == 0:
+            messagebox.showinfo("Info",
+                                "No 040 B board modifications to save.")
+            return
+        out_dir = self._get_output_dir()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stem = Path(self.fw_040b.path).stem
+        path = filedialog.asksaveasfilename(
+            title="Save Patched 040 B Flash",
+            defaultextension=".bin",
+            filetypes=[("Binary files", "*.bin")],
+            initialdir=str(out_dir),
+            initialfile=f"{stem}_patched_{ts}.bin")
+        if path:
+            self.root.config(cursor="watch")
+            self.root.update()
+            try:
+                self.fw_040b.save_flash(path)
+            finally:
+                self.root.config(cursor="")
+            log = self._auto_export_log_b040(path)
+            msg = f"Patched 040 B flash saved to:\n{path}"
+            if log:
+                msg += f"\n\nPatch log:\n{log}"
+            messagebox.showinfo("Saved", msg)
+
+    def _auto_export_log_b040(self, bin_path: str) -> Optional[str]:
+        if not self.fw_040b.mods:
+            return None
+        log_path = Path(bin_path).with_suffix(".txt")
+        self._write_b040_log(str(log_path))
+        return str(log_path)
+
+    def _export_b040_log(self):
+        if not self.fw_040b.mods:
+            messagebox.showinfo("Info",
+                                "No 040 B board modifications to export.")
+            return
+        out_dir = self._get_output_dir()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = filedialog.asksaveasfilename(
+            title="Export 040 B Patch Log",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt")],
+            initialdir=str(out_dir),
+            initialfile=f"040B_patch_log_{ts}.txt")
+        if path:
+            self._write_b040_log(path)
+            messagebox.showinfo("Exported", f"Log saved to:\n{path}")
+
+    def _write_b040_log(self, path: str):
+        fw = self.fw_040b
+        with open(path, "w") as f:
+            f.write("TW8836 (040 B Board) Firmware Patch Log\n")
+            f.write(f"{'='*60}\n")
+            f.write(f"Generated:       "
+                    f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Source:          {fw.path}\n")
+            f.write(f"Header SHA256:   {fw.sha_orig()}\n")
+            f.write(f"Bytes changed:   {fw.diff_count()}\n\n")
+            for i, mod in enumerate(fw.mods, 1):
+                f.write(f"[{i}] {mod.desc}\n")
+                f.write(f"    Decoded offset: 0x{mod.offset:06X}\n")
+                f.write(f"    Old: {mod.old.hex(' ')}\n")
+                f.write(f"    New: {mod.new.hex(' ')}\n\n")
 
     def _auto_export_log_b(self, bin_path: str) -> Optional[str]:
         if not self.fw_b.mods:
@@ -3131,6 +4060,24 @@ class App:
                                "Reset all A board changes to stock?"):
             self.fw_a.reset_all()
             self._refresh_a_all()
+
+    def _reset_b040(self):
+        if not self.fw_040b.data:
+            return
+        if messagebox.askyesno("Confirm",
+                               "Reset all 040 B board changes to stock?"):
+            self.fw_040b.reset_all()
+            self._refresh_b040_all()
+
+    def _preset_b040_delays(self, factor: float):
+        if not self.fw_040b.data:
+            messagebox.showwarning("Warning", "No 040 B firmware loaded.")
+            return
+        for dc in self.fw_040b.delays:
+            if dc.original_ms >= 100:
+                self.fw_040b.set_delay(
+                    dc, max(5, int(dc.original_ms * factor)))
+        self._refresh_b040_all()
 
     def _reset_b_delays(self):
         if not self.fw_b.data:
