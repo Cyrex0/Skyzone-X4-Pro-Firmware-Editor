@@ -66,6 +66,7 @@ bool FirmwareABoard::Load(const std::string& path) {
     FindStrings();
     FindTimingSites();
     FindPanelInits();
+    FindVersionStrings();
     return true;
 }
 
@@ -385,5 +386,135 @@ void FirmwareABoard::FindPanelInits() {
                 panel_inits_.push_back(e);
             }
         }
+    }
+}
+
+// ── Version string discovery & patching ─────────────────────────────
+bool FirmwareABoard::PatchString(VersionStringEntry& vs, const std::string& new_text) {
+    if (new_text.size() > vs.max_length) return false;
+    if (new_text.empty()) return false;
+
+    // Write new text bytes
+    for (size_t i = 0; i < new_text.size(); ++i)
+        WriteDecoded(vs.payload_offset + (uint32_t)i, (uint8_t)new_text[i]);
+
+    // Null-fill remainder (up to and including the original null terminator space)
+    for (size_t i = new_text.size(); i <= vs.max_length; ++i)
+        WriteDecoded(vs.payload_offset + (uint32_t)i, 0);
+
+    vs.text = new_text;
+    vs.modified = (new_text != vs.original);
+
+    // Re-extract strings so the Strings tab stays in sync
+    FindStrings();
+    return true;
+}
+
+void FirmwareABoard::FindVersionStrings() {
+    version_strings_.clear();
+
+    // Helper: compute available space for a null-terminated string at 'start'
+    auto computeSpace = [&](uint32_t start) -> uint32_t {
+        // Find end of current text
+        uint32_t pos = start;
+        while (pos < (uint32_t)decoded_.size() && decoded_[pos] != 0) ++pos;
+        // Count consecutive nulls
+        while (pos < (uint32_t)decoded_.size() && decoded_[pos] == 0) ++pos;
+        return pos - start; // total bytes including nulls
+    };
+
+    // ── 1. Find model name block ("SKY04X PRO" or "SKY04O PRO") ──
+    const char* model_pats[] = {"SKY04X PRO", "SKY04O PRO"};
+    for (auto pat : model_pats) {
+        size_t plen = strlen(pat);
+        auto it = std::search(decoded_.begin(), decoded_.end(), pat, pat + plen);
+        if (it == decoded_.end()) continue;
+
+        uint32_t model_off = (uint32_t)(it - decoded_.begin());
+        uint32_t model_space = computeSpace(model_off);
+
+        // Model name entry
+        {
+            VersionStringEntry vs;
+            vs.payload_offset = model_off;
+            vs.max_length = model_space > 0 ? model_space - 1 : 0;
+            vs.text.assign((char*)&decoded_[model_off], plen);
+            vs.original = vs.text;
+            vs.label = "Model Name";
+            version_strings_.push_back(vs);
+        }
+
+        // Firmware version at model_off - 12 (e.g. "4.1.7")
+        if (model_off >= 12) {
+            uint32_t fw_off = model_off - 12;
+            std::string fw_ver;
+            for (uint32_t j = 0; j < 8 && fw_off + j < (uint32_t)decoded_.size(); ++j) {
+                uint8_t b = decoded_[fw_off + j];
+                if (b >= 32 && b < 127) fw_ver += (char)b;
+                else break;
+            }
+            if (fw_ver.size() >= 3 && fw_off + fw_ver.size() < decoded_.size()
+                && decoded_[fw_off + fw_ver.size()] == 0) {
+                uint32_t space = computeSpace(fw_off);
+                VersionStringEntry vs;
+                vs.payload_offset = fw_off;
+                vs.max_length = space > 0 ? space - 1 : 0;
+                vs.text = fw_ver;
+                vs.original = fw_ver;
+                vs.label = "Firmware Version";
+                version_strings_.push_back(vs);
+            }
+        }
+
+        // Version prefix at model_off - 4 (e.g. "V4")
+        if (model_off >= 4) {
+            uint32_t vp_off = model_off - 4;
+            std::string vp;
+            for (uint32_t j = 0; j < 4 && vp_off + j < (uint32_t)decoded_.size(); ++j) {
+                uint8_t b = decoded_[vp_off + j];
+                if (b >= 32 && b < 127) vp += (char)b;
+                else break;
+            }
+            if (vp.size() >= 2 && vp_off + vp.size() < decoded_.size()
+                && decoded_[vp_off + vp.size()] == 0) {
+                uint32_t space = computeSpace(vp_off);
+                VersionStringEntry vs;
+                vs.payload_offset = vp_off;
+                vs.max_length = space > 0 ? space - 1 : 0;
+                vs.text = vp;
+                vs.original = vp;
+                vs.label = "Version Prefix";
+                version_strings_.push_back(vs);
+            }
+        }
+        break; // only process first model match
+    }
+
+    // ── 2. Find software/SDK version ("V?.?.?") ──
+    for (uint32_t i = 0; i + 6 < (uint32_t)decoded_.size(); ++i) {
+        if (decoded_[i] != 'V') continue;
+        if (!std::isdigit(decoded_[i+1])) continue;
+        if (decoded_[i+2] != '.') continue;
+        if (!std::isdigit(decoded_[i+3])) continue;
+        if (decoded_[i+4] != '.') continue;
+        if (!std::isdigit(decoded_[i+5])) continue;
+        if (i + 6 >= (uint32_t)decoded_.size() || decoded_[i+6] != 0) continue;
+
+        // Skip if already captured (e.g. same as version prefix)
+        bool dup = false;
+        for (auto& vs : version_strings_)
+            if (vs.payload_offset == i) { dup = true; break; }
+        if (dup) continue;
+
+        std::string ver((char*)&decoded_[i], 6);
+        uint32_t space = computeSpace(i);
+        VersionStringEntry vs;
+        vs.payload_offset = i;
+        vs.max_length = space > 0 ? space - 1 : 0;
+        vs.text = ver;
+        vs.original = ver;
+        vs.label = "Software Version";
+        version_strings_.push_back(vs);
+        break; // take first match only
     }
 }

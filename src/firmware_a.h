@@ -32,6 +32,15 @@ struct StringEntry {
     std::string section; // "code" or "data"
 };
 
+struct VersionStringEntry {
+    uint32_t    payload_offset = 0;
+    uint32_t    max_length     = 0;   // max chars (excluding null terminator)
+    std::string text;                 // current value
+    std::string original;             // original value (for reset)
+    std::string label;                // "Model Name", "Firmware Version", etc.
+    bool        modified       = false;
+};
+
 // â”€â”€ Panel OLED register database â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 struct PanelRegInfo { const char* name; const char* desc; };
 
@@ -485,6 +494,7 @@ public:
 
     void SetFramePeriod(FrameTimingSite& s, uint16_t us);
     void SetPanelValue(PanelInitEntry& e, uint8_t val);
+    bool PatchString(VersionStringEntry& vs, const std::string& new_text);
 
     // accessors
     const std::vector<uint8_t>& Decoded() const { return decoded_; }
@@ -492,6 +502,7 @@ public:
     std::vector<FrameTimingSite>&  TimingSites()  { return timing_sites_; }
     std::vector<PanelInitEntry>&   PanelInits()   { return panel_inits_; }
     std::vector<StringEntry>&      Strings()      { return strings_; }
+    std::vector<VersionStringEntry>& VersionStrings() { return version_strings_; }
 
     const std::string& Filename()  const { return filename_; }
     const std::string& BuildDate() const { return build_date_; }
@@ -517,6 +528,7 @@ private:
     void FindStrings();
     void FindTimingSites();
     void FindPanelInits();
+    void FindVersionStrings();
 
     // ARM Thumb helpers
     static uint16_t DecodeMOVW(const uint8_t* p);
@@ -527,6 +539,7 @@ private:
     std::vector<FrameTimingSite> timing_sites_;
     std::vector<PanelInitEntry>  panel_inits_;
     std::vector<StringEntry>     strings_;
+    std::vector<VersionStringEntry> version_strings_;
     std::string filename_;
     std::string build_date_;
     bool is_040_ = false;

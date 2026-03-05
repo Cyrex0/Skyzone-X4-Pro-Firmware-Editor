@@ -1286,6 +1286,194 @@ static void DrawAPanel(FirmwareABoard& ab) {
     }
 }
 
+
+// ── Version / Branding ─────────────────────────────────────────────
+static void DrawVersionBranding(FirmwareABoard& ab) {
+    if (!ab.IsLoaded()) { ImGui::TextColored(COL_DIM, "Load A firmware first."); return; }
+    auto& vers = ab.VersionStrings();
+    if (vers.empty()) {
+        ImGui::TextColored(COL_DIM, "No version strings detected in this firmware.");
+        return;
+    }
+
+    ImGui::TextColored(COL_HEADER, "Version / Branding");
+    ImGui::SameLine(); HelpMarker(
+        "Edit version strings embedded in the firmware.\n"
+        "These appear on the goggle OSD so users can identify\n"
+        "custom/modified firmware at a glance.\n\n"
+        "IMPORTANT: Each string has a maximum character limit.\n"
+        "Strings are null-terminated and cannot exceed their\n"
+        "original allocated space in the firmware image.");
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // Info box
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.15f, 0.22f, 1.0f));
+    ImGui::BeginChild("##ver_info", ImVec2(0, 58), true);
+    ImGui::TextColored(COL_CYAN, "  OSD Version Display");
+    ImGui::TextWrapped("  These strings are shown on the goggle OSD. Modify them to indicate "
+                       "custom firmware. Keep within the character limits shown.");
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
+
+    // Edit fields
+    static char edit_bufs[8][64] = {};
+    static bool inited = false;
+    if (!inited) {
+        for (size_t i = 0; i < vers.size() && i < 8; ++i) {
+            strncpy(edit_bufs[i], vers[i].text.c_str(), 63);
+            edit_bufs[i][63] = 0;
+        }
+        inited = true;
+    }
+    // Re-sync if firmware was reloaded (check first entry)
+    if (vers.size() > 0 && strcmp(edit_bufs[0], vers[0].text.c_str()) != 0
+        && !vers[0].modified) {
+        for (size_t i = 0; i < vers.size() && i < 8; ++i) {
+            strncpy(edit_bufs[i], vers[i].text.c_str(), 63);
+            edit_bufs[i][63] = 0;
+        }
+    }
+
+    // Reorder: show Firmware Version first, then Model Name, then others
+    int order[8];
+    int n = (int)vers.size();
+    if (n > 8) n = 8;
+    // Build display order: Firmware Version, Model Name, Version Prefix, Software Version
+    int oi = 0;
+    for (int i = 0; i < n; ++i) if (vers[i].label == "Firmware Version") order[oi++] = i;
+    for (int i = 0; i < n; ++i) if (vers[i].label == "Model Name")       order[oi++] = i;
+    for (int i = 0; i < n; ++i) if (vers[i].label == "Version Prefix")   order[oi++] = i;
+    for (int i = 0; i < n; ++i) if (vers[i].label == "Software Version") order[oi++] = i;
+    // Any remaining
+    for (int i = 0; i < n; ++i) {
+        bool found = false;
+        for (int j = 0; j < oi; ++j) if (order[j] == i) found = true;
+        if (!found) order[oi++] = i;
+    }
+
+    bool any_modified = false;
+    for (int idx = 0; idx < oi; ++idx) {
+        int i = order[idx];
+        auto& vs = vers[i];
+
+        ImGui::PushID(i);
+
+        // Label column
+        bool is_mod = vs.modified;
+        if (is_mod) ImGui::PushStyleColor(ImGuiCol_Text, COL_CHANGED);
+        ImGui::Text("%-20s", vs.label.c_str());
+        if (is_mod) ImGui::PopStyleColor();
+
+        ImGui::SameLine(180);
+
+        // Input field
+        ImGui::SetNextItemWidth(200);
+        char label_id[32]; snprintf(label_id, sizeof(label_id), "##vs%d", i);
+
+        if (ImGui::InputText(label_id, edit_bufs[i], vs.max_length + 1,
+                             ImGuiInputTextFlags_EnterReturnsTrue)) {
+            ab.PatchString(vs, edit_bufs[i]);
+        }
+
+        // Apply on deactivation too (tab away, click elsewhere)
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            ab.PatchString(vs, edit_bufs[i]);
+        }
+
+        // Length indicator
+        ImGui::SameLine();
+        size_t cur_len = strlen(edit_bufs[i]);
+        ImVec4 len_col = (cur_len > vs.max_length) ? COL_RED :
+                         (cur_len == vs.max_length) ? COL_YELLOW : COL_DIM;
+        ImGui::TextColored(len_col, "(%zu/%u)", cur_len, vs.max_length);
+
+        // Offset info
+        ImGui::SameLine();
+        ImGui::TextColored(COL_DIM, " [0x%05X]", vs.payload_offset);
+
+        // Modified indicator
+        if (is_mod) {
+            ImGui::SameLine();
+            ImGui::TextColored(COL_CHANGED, "(modified)");
+            any_modified = true;
+        }
+
+        ImGui::PopID();
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // ── Quick presets ──
+    ImGui::TextColored(COL_HEADER, "Quick Presets");
+    ImGui::SameLine(); HelpMarker(
+        "Apply common branding presets with one click.\n"
+        "These modify the Model Name and Firmware Version\n"
+        "to clearly indicate custom firmware.");
+
+    // Find indices for model name and firmware version
+    int model_idx = -1, fwver_idx = -1;
+    for (int i = 0; i < n; ++i) {
+        if (vers[i].label == "Model Name") model_idx = i;
+        if (vers[i].label == "Firmware Version") fwver_idx = i;
+    }
+
+    auto applyPreset = [&](const char* model_suffix, const char* ver_suffix) {
+        if (model_idx >= 0) {
+            std::string base = vers[model_idx].original;
+            // Try to fit suffix, truncating base if needed
+            std::string newm = base;
+            if (model_suffix[0]) {
+                size_t max_base = vers[model_idx].max_length - strlen(model_suffix) - 1;
+                if (max_base < base.size()) newm = base.substr(0, max_base);
+                newm += " ";
+                newm += model_suffix;
+            }
+            if (newm.size() <= vers[model_idx].max_length) {
+                strncpy(edit_bufs[model_idx], newm.c_str(), 63);
+                ab.PatchString(vers[model_idx], newm);
+            }
+        }
+        if (fwver_idx >= 0 && ver_suffix[0]) {
+            std::string base = vers[fwver_idx].original;
+            std::string newv = base + ver_suffix;
+            if (newv.size() <= vers[fwver_idx].max_length) {
+                strncpy(edit_bufs[fwver_idx], newv.c_str(), 63);
+                ab.PatchString(vers[fwver_idx], newv);
+            }
+        }
+    };
+
+    if (ImGui::Button("MOD")) applyPreset("M", "M");
+    ImGui::SameLine(); HelpMarker("Sets model to 'SKY04X PRO M'\nand version to e.g. '4.1.7M'");
+
+    ImGui::SameLine();
+    if (ImGui::Button("LL (Low Latency)")) applyPreset("LL", "LL");
+    ImGui::SameLine(); HelpMarker("Sets model to 'SKY04X LL'\nand version to e.g. '4.1.7LL'");
+
+    ImGui::SameLine();
+    if (ImGui::Button("CUSTOM")) applyPreset("CUS", "C");
+    ImGui::SameLine(); HelpMarker("Sets model to 'SKY04X CUS'\nand version to e.g. '4.1.7C'");
+
+    ImGui::SameLine();
+    if (ImGui::Button("Reset All")) {
+        for (int i = 0; i < n; ++i) {
+            ab.PatchString(vers[i], vers[i].original);
+            strncpy(edit_bufs[i], vers[i].original.c_str(), 63);
+        }
+    }
+    ImGui::SameLine(); HelpMarker("Reset all strings to their original firmware values.");
+
+    // ── Status summary ──
+    if (any_modified) {
+        ImGui::Spacing();
+        ImGui::TextColored(COL_CHANGED, "* Strings modified — save firmware to apply changes.");
+    }
+}
+
 static void DrawAStrings(FirmwareABoard& ab) {
     if (!ab.IsLoaded()) { ImGui::TextColored(COL_DIM, "Load A firmware first."); return; }
     auto& strs = ab.Strings();
@@ -1466,6 +1654,7 @@ void DrawEditorUI(FirmwareBBoard& bb, FirmwareABoard& ab, Firmware040B& b040,
                 if (ImGui::BeginTabItem("Overview"))       { DrawAOverview(ab); ImGui::EndTabItem(); }
                 if (ImGui::BeginTabItem("Frame Timing"))   { DrawATiming(ab); ImGui::EndTabItem(); }
                 if (ImGui::BeginTabItem("Panel Init"))     { DrawAPanel(ab); ImGui::EndTabItem(); }
+                if (ImGui::BeginTabItem("Version / Branding")) { DrawVersionBranding(ab); ImGui::EndTabItem(); }
                 if (ImGui::BeginTabItem("Strings"))        { DrawAStrings(ab); ImGui::EndTabItem(); }
                 if (ImGui::BeginTabItem("Reg Reference"))  { DrawARegReference(ab); ImGui::EndTabItem(); }
                 if (ImGui::BeginTabItem("Hex View"))       { DrawAHex(ab); ImGui::EndTabItem(); }
